@@ -2,7 +2,7 @@
   "name": "A-Eye 起步警示",
   "short_name": "A-Eye",
   "description": "前車移動與紅綠燈即時偵測警示",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#0a0a0a",
