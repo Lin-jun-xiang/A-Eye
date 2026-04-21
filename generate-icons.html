@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html><body>
+<canvas id="c"></canvas>
+<script>
+function gen(size, filename) {
+  const c = document.getElementById('c');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+
+  // 背景
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, size, size);
+
+  // 圓角背景
+  const m = size * 0.1;
+  const r = size * 0.18;
+  ctx.beginPath();
+  ctx.roundRect(m, m, size - m*2, size - m*2, r);
+  ctx.fillStyle = '#111';
+  ctx.fill();
+
+  // 眼睛圖示
+  const cx = size/2, cy = size * 0.42;
+  const ew = size * 0.28, eh = size * 0.16;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, ew, eh, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#4ade80';
+  ctx.fill();
+
+  // 瞳孔
+  ctx.beginPath();
+  ctx.arc(cx, cy, size * 0.07, 0, Math.PI * 2);
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fill();
+
+  // 文字
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${size * 0.14}px -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('A-Eye', cx, size * 0.72);
+
+  // 下載
+  const a = document.createElement('a');
+  a.download = filename;
+  a.href = c.toDataURL('image/png');
+  a.click();
+}
+gen(192, 'icon-192.png');
+setTimeout(() => gen(512, 'icon-512.png'), 500);
+</script>
+</body></html>
