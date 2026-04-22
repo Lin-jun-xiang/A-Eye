@@ -5,7 +5,7 @@
 //   2. MiDaS Small (ONNX) — 深度估測輔助前車判斷（選用）
 //   3. COCO-SSD fallback — ONNX 模型檔不存在時自動降級
 //   4. 狀態機 + IoU 追蹤 + EMA 平滑
-//   5. GPS 測速（主）+ 靜態物件追蹤（備）+ 路面光流（末）
+//   5. GPS 測速 — 自車運動偵測
 
 // =============================================
 // DOM
@@ -33,6 +33,22 @@ const YOLO_IOU_THRESHOLD = 0.45;
 // MiDaS
 const MIDAS_INPUT_SIZE = 256;
 
+// UFLD (Ultra-Fast-Lane-Detection)
+const UFLD_INPUT_W = 800;
+const UFLD_INPUT_H = 288;
+const UFLD_NUM_GRIDDING = 100;   // TuSimple griding_num
+const UFLD_NUM_CLS = 56;         // row anchors 數量
+const UFLD_NUM_LANES = 4;        // 最多 4 條車道線
+const UFLD_RUN_EVERY = 5;        // 每 N 幀跑一次（省電）
+// TuSimple row anchors (原圖 720p 下的 y 像素)
+const UFLD_ROW_ANCHORS = [
+  64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112,
+  116, 120, 124, 128, 132, 136, 140, 144, 148, 152, 156, 160,
+  164, 168, 172, 176, 180, 184, 188, 192, 196, 200, 204, 208,
+  212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252, 256,
+  260, 264, 268, 272, 276, 280, 284
+];
+
 // 狀態機門檻
 const LOCK_ENTER_FRAMES = 3;
 const DISAPPEAR_EXIT_FRAMES = 5;
@@ -44,11 +60,6 @@ const MOVE_Y_ENTER = 0.025;
 const MOVE_HISTORY = 12;
 const MOVE_CONFIRM_FRAMES = 4;
 
-// 行駛中前車加速遠離判定（高速公路場景）
-const ACCEL_AWAY_RATIO = 0.15;       // 面積縮小 > 15% → 前車加速遠離
-const ACCEL_AWAY_CONFIRM = 3;        // 連續 N 幀確認
-const ACCEL_AWAY_HISTORY = 8;        // 歷史窗口
-
 // EMA（更低 = 更平滑，抗抖動）
 const EMA_ALPHA = 0.18;
 
@@ -56,26 +67,10 @@ const EMA_ALPHA = 0.18;
 const IOU_LOCK_MATCH = 0.15;
 const IOU_CANDIDATE = 0.25;
 
-// 自車運動 — GPS 測速（主）+ 靜態物件追蹤（備）+ 路面光流（末）
-// GPS：navigator.geolocation 提供 speed (m/s)，最可靠
+// 自車運動 — GPS 測速
+// GPS：navigator.geolocation 提供 speed (m/s)
 const GPS_MOVE_SPEED = 1.5;          // > 1.5 m/s (~5.4 km/h) → 移動
 const GPS_STILL_SPEED = 0.5;         // < 0.5 m/s (~1.8 km/h) → 靜止
-
-// 靜態物件：紅綠燈、消防栓、停止標誌等不會動的東西
-const STATIC_CLASSES = new Set([9, 10, 11, 12, 13]);
-const STATIC_MOVE_THRESHOLD = 8;
-const STATIC_STILL_THRESHOLD = 3;
-const STATIC_MATCH_IOU = 0.25;
-
-// 路面光流 fallback（無 GPS + 無靜態物件時才用）
-const FLOW_CANVAS_W = 120;
-const FLOW_ROI_TOP = 0.65;
-const FLOW_ROI_BOTTOM = 0.95;
-const FLOW_MAX_SHIFT = 20;
-const FLOW_MOVE_THRESHOLD = 3.5;
-const FLOW_STILL_THRESHOLD = 1.5;
-
-const EGO_SMOOTH_FRAMES = 5;
 
 // 紅綠燈
 const LIGHT_CONFIRM_FRAMES = 2;
@@ -111,16 +106,17 @@ let lastAlertTime = { move: 0, green: 0 };
 // 模型
 let yoloSession = null;
 let midasSession = null;
+let ufldSession = null;
 let cocoModel = null;
 let useOnnx = false;
 let useMidas = false;
+let useUfld = false;
 
 // 前車
 let smoothedBbox = null;
 let lockFrameCount = 0;
 let disappearFrameCount = 0;
 let moveConfirmCount = 0;
-let accelAwayCount = 0;              // 行駛中前車加速遠離計數
 let bboxHistory = [];
 let lockCandidate = null;
 
@@ -136,14 +132,14 @@ const DEPTH_RUN_EVERY = 3;  // 每 N 幀才跑一次 MiDaS
 
 // 自車運動
 let egoMoving = false;
-let prevFlowStrip = null;
-let egoMotionHistory = [];
-let prevStaticObjects = [];
 let gpsWatchId = null;               // GPS watchPosition ID
 let lastGpsSpeed = null;             // 最新 GPS 速度 (m/s)，null = 無 GPS
 let lastGpsTime = 0;                 // 最後收到 GPS 的時間
-const flowCanvas = document.createElement('canvas');
-const flowCtx = flowCanvas.getContext('2d', { willReadFrequently: true });
+
+// 車道線 (UFLD)
+let lastLanes = null;                // 最近一次車道線結果 [{x, y}[], ...]
+let lastEgoLane = null;              // {leftX(y), rightX(y)} 自車車道邊界函數
+let ufldFrameCounter = 0;
 
 // 螢幕
 let screenOff = false;
@@ -225,8 +221,15 @@ async function requestWakeLock() {
 async function togglePiP() {
   try {
     if (document.pictureInPictureElement) await document.exitPictureInPicture();
-    else if (video.requestPictureInPicture) await video.requestPictureInPicture();
-  } catch {}
+    else if (video.requestPictureInPicture) await video.requestPictureInPicture();  } catch {}
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
 }
 
 // =============================================
@@ -256,10 +259,23 @@ async function loadModels() {
           graphOptimizationLevel: 'all',
         });
         useMidas = true;
-        console.log('[A-Eye] MiDaS Small ONNX 載入成功');
-      } catch (e) {
+        console.log('[A-Eye] MiDaS Small ONNX 載入成功');      } catch (e) {
         console.warn('[A-Eye] MiDaS 載入失敗（深度停用）:', e.message);
         useMidas = false;
+      }
+
+      // 嘗試載入 UFLD (Ultra-Fast-Lane-Detection)
+      try {
+        statusText.textContent = '載入車道線模型...';
+        ufldSession = await ort.InferenceSession.create('./models/ufld_tusimple.onnx', {
+          executionProviders: ['webgl', 'wasm'],
+          graphOptimizationLevel: 'all',
+        });
+        useUfld = true;
+        console.log('[A-Eye] UFLD ONNX 載入成功');
+      } catch (e) {
+        console.warn('[A-Eye] UFLD 載入失敗（車道線停用）:', e.message);
+        useUfld = false;
       }
 
     } catch (e) {
@@ -267,19 +283,20 @@ async function loadModels() {
       useOnnx = false;
     }
   }
-
-  // Fallback: COCO-SSD
+  // Fallback: COCO-SSD（動態載入 TF.js + COCO-SSD）
   if (!useOnnx) {
     statusText.textContent = '載入 COCO-SSD 模型...';
-    if (typeof cocoSsd !== 'undefined') {
+    try {
+      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
       cocoModel = await cocoSsd.load({ base: 'mobilenet_v2' });
       console.log('[A-Eye] COCO-SSD 載入成功 (fallback)');
-    } else {
+    } catch (e2) {
       throw new Error('無法載入任何偵測模型');
     }
   }
 
-  const info = useOnnx ? `YOLOv8n${useMidas ? ' + MiDaS' : ''}` : 'COCO-SSD';
+  const info = useOnnx ? `YOLOv8n${useMidas ? ' + MiDaS' : ''}${useUfld ? ' + UFLD' : ''}` : 'COCO-SSD';
   statusText.textContent = `模型: ${info}`;
 }
 
@@ -445,8 +462,160 @@ function getDepthForBbox(depthMap, bbox, vw, vh) {
       sum += depthMap[y * size + x];
       count++;
     }
+  }  return count > 0 ? sum / count : 0;
+}
+
+// =============================================
+// UFLD 車道線偵測
+// =============================================
+function ufldPreprocess(videoEl) {
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  preCanvas.width = UFLD_INPUT_W;
+  preCanvas.height = UFLD_INPUT_H;
+  preCtx.drawImage(videoEl, 0, 0, vw, vh, 0, 0, UFLD_INPUT_W, UFLD_INPUT_H);
+  const pixels = preCtx.getImageData(0, 0, UFLD_INPUT_W, UFLD_INPUT_H).data;
+
+  const mean = [0.485, 0.456, 0.406];
+  const std  = [0.229, 0.224, 0.225];
+  const total = UFLD_INPUT_W * UFLD_INPUT_H;
+  const float32 = new Float32Array(3 * total);
+  for (let i = 0; i < total; i++) {
+    float32[i]             = (pixels[i * 4]     / 255 - mean[0]) / std[0];
+    float32[total + i]     = (pixels[i * 4 + 1] / 255 - mean[1]) / std[1];
+    float32[2 * total + i] = (pixels[i * 4 + 2] / 255 - mean[2]) / std[2];
   }
-  return count > 0 ? sum / count : 0;
+  return float32;
+}
+
+async function ufldDetectLanes(videoEl) {
+  if (!ufldSession) return null;
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  const tensor = ufldPreprocess(videoEl);
+  const input = new ort.Tensor('float32', tensor, [1, 3, UFLD_INPUT_H, UFLD_INPUT_W]);
+  const feeds = {};
+  feeds[ufldSession.inputNames[0]] = input;
+  const results = await ufldSession.run(feeds);
+  const output = results[ufldSession.outputNames[0]].data;
+
+  // output shape: [1, (UFLD_NUM_GRIDDING+1) * UFLD_NUM_CLS * UFLD_NUM_LANES]
+  // reshape → [UFLD_NUM_LANES][UFLD_NUM_CLS][UFLD_NUM_GRIDDING+1]
+  const G = UFLD_NUM_GRIDDING, C = UFLD_NUM_CLS, L = UFLD_NUM_LANES;
+  const lanes = [];
+
+  for (let lane = 0; lane < L; lane++) {
+    const points = [];
+    for (let cls = 0; cls < C; cls++) {
+      // softmax 取 argmax
+      const offset = (lane * C + cls) * (G + 1);
+      let maxVal = -Infinity, maxIdx = G; // G = "不存在"
+      for (let g = 0; g <= G; g++) {
+        if (output[offset + g] > maxVal) {
+          maxVal = output[offset + g];
+          maxIdx = g;
+        }
+      }
+      if (maxIdx === G) continue; // 該 row 無車道線
+
+      // gridding index → 原始影像 x 座標
+      const x = (maxIdx + 0.5) / G * vw;
+      // row anchor → 原始影像 y 座標 (row anchors 基於 720p)
+      const y = UFLD_ROW_ANCHORS[cls] / 720 * vh;
+      points.push({ x, y });
+    }
+    if (points.length >= 2) lanes.push(points);
+  }
+  return lanes;
+}
+
+/**
+ * 從偵測到的車道線中判定自車車道 (ego-lane) 的左右邊界。
+ * 策略：取在畫面底部最接近中心的左側線 & 右側線。
+ *
+ * @returns {leftLane, rightLane} 各為 [{x,y},...] 或 null
+ */
+function findEgoLane(lanes, vw, vh) {
+  if (!lanes || lanes.length < 2) return null;
+
+  const centerX = vw / 2;
+  const bottomY = vh * 0.9;
+
+  // 對每條線，取其底部 (最大 y) 的 x 值
+  const lanesWithBottomX = lanes.map(pts => {
+    // 取最靠近 bottomY 的點
+    let best = pts[pts.length - 1]; // 最後一個通常最低
+    for (const p of pts) {
+      if (Math.abs(p.y - bottomY) < Math.abs(best.y - bottomY)) best = p;
+    }
+    return { pts, bottomX: best.x };
+  });
+
+  // 分左 (bottomX < center) 右 (bottomX > center)
+  let bestLeft = null, bestRight = null;
+  let bestLeftDist = Infinity, bestRightDist = Infinity;
+
+  for (const l of lanesWithBottomX) {
+    const dist = Math.abs(l.bottomX - centerX);
+    if (l.bottomX <= centerX && dist < bestLeftDist) {
+      bestLeftDist = dist;
+      bestLeft = l.pts;
+    }
+    if (l.bottomX > centerX && dist < bestRightDist) {
+      bestRightDist = dist;
+      bestRight = l.pts;
+    }
+  }
+
+  if (!bestLeft || !bestRight) return null;
+  return { leftLane: bestLeft, rightLane: bestRight };
+}
+
+/**
+ * 給定 y 座標，由車道線點集用線性內插算出 x 座標
+ */
+function laneXatY(lanePoints, y) {
+  if (!lanePoints || lanePoints.length === 0) return null;
+  // 找包夾 y 的兩個點
+  // lanePoints 已按 y 排序（row anchor 從上到下）
+  if (y <= lanePoints[0].y) return lanePoints[0].x;
+  if (y >= lanePoints[lanePoints.length - 1].y) return lanePoints[lanePoints.length - 1].x;
+
+  for (let i = 0; i < lanePoints.length - 1; i++) {
+    const p0 = lanePoints[i], p1 = lanePoints[i + 1];
+    if (y >= p0.y && y <= p1.y) {
+      const t = (y - p0.y) / (p1.y - p0.y);
+      return p0.x + t * (p1.x - p0.x);
+    }
+  }
+  return lanePoints[lanePoints.length - 1].x;
+}
+
+/**
+ * 判斷車輛 bbox 是否在自車車道內
+ * @returns 0~1 的權重，1 = 完全在車道內，0 = 完全在外
+ */
+function egoLaneWeight(bbox, egoLane, vh) {
+  if (!egoLane) return null; // 無車道資訊，fallback
+
+  const [bx, by, bw, bh] = bbox;
+  const carCenterX = bx + bw / 2;
+  const carBottomY = by + bh;
+
+  const leftX = laneXatY(egoLane.leftLane, carBottomY);
+  const rightX = laneXatY(egoLane.rightLane, carBottomY);
+  if (leftX === null || rightX === null) return null;
+
+  const laneWidth = rightX - leftX;
+  if (laneWidth <= 0) return null;
+
+  // 車輛中心在車道內的程度
+  if (carCenterX >= leftX && carCenterX <= rightX) {
+    return 1.0;
+  }
+  // 在車道外，根據距離衰減
+  const distOutside = carCenterX < leftX
+    ? (leftX - carCenterX) : (carCenterX - rightX);
+  const decay = Math.exp(-2 * distOutside / laneWidth);
+  return decay;
 }
 
 // =============================================
@@ -496,12 +665,9 @@ function median(arr) {
 }
 
 // =============================================
-// 自車運動偵測 — GPS（主）+ 靜態物件（備）+ 路面光流（末）
+// 自車運動偵測 — GPS 測速
 // =============================================
-// 優先級：GPS speed > 靜態物件追蹤 > 路面光流
-// GPS 最可靠（不受視覺干擾），高速公路也能用。
-// 靜態物件在市區等紅燈最有用。
-// 路面光流是最後手段。
+// GPS 提供 speed (m/s)，搭配遲滯門檻判斷移動/靜止。
 
 // --- GPS 測速 ---
 function startGps() {
@@ -549,187 +715,45 @@ function detectEgoMotionByGps() {
   return lastGpsSpeed;
 }
 
-// --- 靜態物件追蹤（從 YOLO 偵測結果中提取） ---
-function detectEgoMotionByStatic(predictions, vw, vh) {
-  // 提取當前幀靜態物件
-  const currStatic = [];
-  for (const p of predictions) {
-    if (STATIC_CLASSES.has(p.classId) && p.score > 0.3) {
-      const [x, y, w, h] = p.bbox;
-      currStatic.push({ cx: x + w / 2, cy: y + h / 2, w, h, classId: p.classId, bbox: p.bbox });
-    }
-  }
-
-  // 當前幀或上一幀無靜態物件 → 無法判斷
-  if (currStatic.length === 0 || prevStaticObjects.length === 0) {
-    prevStaticObjects = currStatic;
-    return null;
-  }
-
-  // 跨幀匹配：同類別 + IoU
-  const shifts = [];
-  for (const curr of currStatic) {
-    let bestMatch = null, bestIoU = 0;
-    for (const prev of prevStaticObjects) {
-      if (prev.classId !== curr.classId) continue;
-      const iou = calcIoUArray(curr.bbox, prev.bbox);
-      if (iou > bestIoU) { bestIoU = iou; bestMatch = prev; }
-    }
-    if (bestMatch && bestIoU > STATIC_MATCH_IOU) {
-      const dx = curr.cx - bestMatch.cx;
-      const dy = curr.cy - bestMatch.cy;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      shifts.push(dist);
-    }
-  }
-
-  prevStaticObjects = currStatic;
-
-  if (shifts.length === 0) return null;  // 無匹配（物件被遮擋後重現），fallback
-
-  // 取中位數（抗單一物件偵測跳動）
-  shifts.sort((a, b) => a - b);
-  return shifts[Math.floor(shifts.length / 2)];
-}
-
-// --- 路面光流 fallback（分段共識） ---
-function correlateSegment(curr, prev, xStart, xEnd, maxShift) {
-  let bestShift = 0, bestCorr = -Infinity;
-  for (let shift = -maxShift; shift <= maxShift; shift++) {
-    let corr = 0, count = 0;
-    for (let x = xStart; x < xEnd; x++) {
-      const x2 = x + shift;
-      if (x2 >= 0 && x2 < curr.length) {
-        const diff = curr[x] - prev[x2];
-        corr -= diff * diff;
-        count++;
-      }
-    }
-    if (count > 0) corr /= count;
-    if (corr > bestCorr) { bestCorr = corr; bestShift = shift; }
-  }
-  return bestShift;
-}
-
-function detectEgoMotionByFlow() {
-  const vw = video.videoWidth, vh = video.videoHeight;
-  if (!vw) return null;
-
-  flowCanvas.width = FLOW_CANVAS_W;
-  const aspect = vh / vw;
-  const fh = Math.round(FLOW_CANVAS_W * aspect);
-  flowCanvas.height = fh;
-  flowCtx.drawImage(video, 0, 0, FLOW_CANVAS_W, fh);
-
-  const yStart = Math.floor(fh * FLOW_ROI_TOP);
-  const yEnd = Math.floor(fh * FLOW_ROI_BOTTOM);
-  const stripH = yEnd - yStart;
-  if (stripH <= 0) return null;
-
-  const imgData = flowCtx.getImageData(0, yStart, FLOW_CANVAS_W, stripH);
-  const d = imgData.data;
-  const fw = FLOW_CANVAS_W;
-  const currStrip = new Float32Array(fw);
-  for (let x = 0; x < fw; x++) {
-    let sum = 0;
-    for (let y = 0; y < stripH; y++) {
-      const i = (y * fw + x) * 4;
-      sum += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
-    }
-    currStrip[x] = sum / stripH;
-  }
-
-  if (!prevFlowStrip || prevFlowStrip.length !== fw) {
-    prevFlowStrip = currStrip;
-    return null;
-  }
-
-  // 分三段共識
-  const maxShift = FLOW_MAX_SHIFT;
-  const seg = Math.floor(fw / 3);
-  const shifts = [
-    correlateSegment(currStrip, prevFlowStrip, maxShift, seg, maxShift),
-    correlateSegment(currStrip, prevFlowStrip, seg, seg * 2, maxShift),
-    correlateSegment(currStrip, prevFlowStrip, seg * 2, fw - maxShift, maxShift),
-  ];
-  prevFlowStrip = currStrip;
-
-  const signs = shifts.map(s => s > 0 ? 1 : s < 0 ? -1 : 0);
-  const dominantSign = signs[0] + signs[1] + signs[2];
-  const absShifts = shifts.map(Math.abs);
-  absShifts.sort((a, b) => a - b);
-  const consensus = Math.abs(dominantSign) >= 2;
-  return consensus ? absShifts[1] : 0;
-}
-
-// --- 混合決策 ---
-let lastEgoMethod = 'none';
-
-function updateEgoMotion(predictions, vw, vh) {
-  let drift = null;
-  let method = 'none';
-
-  // 1) GPS 最優先
+// --- GPS 決策 ---
+function updateEgoMotion() {
   const gpsSpeed = detectEgoMotionByGps();
-  if (gpsSpeed !== null) {
-    method = 'gps';
-    // GPS 直接用遲滯判斷，不需要中位數濾波（GPS 已經自帶平滑）
-    egoMoving = egoMoving
-      ? gpsSpeed > GPS_STILL_SPEED
-      : gpsSpeed > GPS_MOVE_SPEED;
-    lastEgoMethod = method;
-    return;
-  }
-
-  // 2) 靜態物件追蹤
-  drift = detectEgoMotionByStatic(predictions, vw, vh);
-  if (drift !== null) {
-    method = 'static';
-  }
-
-  // 3) 路面光流
-  if (drift === null) {
-    drift = detectEgoMotionByFlow();
-    method = 'flow';
-  }
-
-  if (drift === null) return;  // 首幀
-
-  // 方法切換時清空歷史
-  if (method !== lastEgoMethod && lastEgoMethod !== 'none' && lastEgoMethod !== 'gps') {
-    egoMotionHistory = [];
-  }
-  lastEgoMethod = method;
-
-  const moveThresh = method === 'static' ? STATIC_MOVE_THRESHOLD : FLOW_MOVE_THRESHOLD;
-  const stillThresh = method === 'static' ? STATIC_STILL_THRESHOLD : FLOW_STILL_THRESHOLD;
-
-  egoMotionHistory.push(drift);
-  if (egoMotionHistory.length > EGO_SMOOTH_FRAMES) egoMotionHistory.shift();
-
-  const sorted = [...egoMotionHistory].sort((a, b) => a - b);
-  const medianDrift = sorted[Math.floor(sorted.length / 2)];
-
+  if (gpsSpeed === null) return;  // GPS 不可用，維持上一狀態
   egoMoving = egoMoving
-    ? medianDrift > stillThresh
-    : medianDrift > moveThresh;
+    ? gpsSpeed > GPS_STILL_SPEED
+    : gpsSpeed > GPS_MOVE_SPEED;
 }
 
 // =============================================
-// 前車篩選 — 面積 + 深度
+// 前車篩選 — 面積 + 深度 + 車道線加權
 // =============================================
 function scoreFrontCar(bbox, vw, vh, depthMap) {
   const [x, y, w, h] = bbox;
   const areaScore = (w * h) / (vw * vh);
 
-  if (depthMap) {
-    const depth = getDepthForBbox(depthMap, bbox, vw, vh);
-    // depth = inverse relative depth（越大 = 越近）
-    // 深度為主（70%），面積為輔（30%）
-    return depth * 0.7 + areaScore * 1000 * 0.3;
+  // --- 車道線加權 (UFLD ego-lane) ---
+  // 如果有車道線資訊，用車道邊界判斷；否則 fallback 到高斯中心加權
+  let hWeight;
+  const laneW = egoLaneWeight(bbox, lastEgoLane, vh);
+  if (laneW !== null) {
+    // 車道內 = 1.0，車道外指數衰減
+    hWeight = laneW;
+  } else {
+    // Fallback: 高斯中心加權（無車道線時）
+    const cx = (x + w / 2) / vw;          // 0~1, 0.5 = 正中央
+    const hDev = (cx - 0.5) / 0.25;       // σ=0.25
+    hWeight = Math.exp(-0.5 * hDev * hDev);
   }
 
-  return areaScore;
+  let baseScore;
+  if (depthMap) {
+    const depth = getDepthForBbox(depthMap, bbox, vw, vh);
+    baseScore = depth * 0.7 + areaScore * 1000 * 0.3;
+  } else {
+    baseScore = areaScore;
+  }
+
+  return baseScore * hWeight;
 }
 
 // =============================================
@@ -794,33 +818,11 @@ function updateCarTracking(vehicles, vw, vh, depthMap) {
 
       if (matched && bestIoU > IOU_LOCK_MATCH) {
         disappearFrameCount = 0;
-        smoothedBbox = emaSmooth(smoothedBbox, matched, EMA_ALPHA);
-        const area = smoothedBbox.w * smoothedBbox.h;        if (egoMoving) {
-          // 行駛中：不偵測「起步」，但偵測「前車加速遠離」
+        smoothedBbox = emaSmooth(smoothedBbox, matched, EMA_ALPHA);        const area = smoothedBbox.w * smoothedBbox.h;
+        if (egoMoving) {
+          // 行駛中：不做任何警示判定
           moveConfirmCount = 0;
-          bboxHistory.push({ area, y: smoothedBbox.y, time: now });
-          if (bboxHistory.length > ACCEL_AWAY_HISTORY) bboxHistory.shift();
-
-          if (bboxHistory.length >= ACCEL_AWAY_HISTORY) {
-            const areas = bboxHistory.map(h => h.area);
-            const halfLen = Math.floor(ACCEL_AWAY_HISTORY / 2);
-            const medianOldArea = median(areas.slice(0, halfLen));
-            const medianNewArea = median(areas.slice(-halfLen));
-            const areaShrink = (medianOldArea - medianNewArea) / (medianOldArea || 1);
-
-            if (areaShrink > ACCEL_AWAY_RATIO) {
-              accelAwayCount++;
-              if (accelAwayCount >= ACCEL_AWAY_CONFIRM) {
-                const a = tryAlert('move', '🚗 前車加速遠離！');
-                if (a) alerts.push(a);
-                resetCarState();
-                sysState = STATE.IDLE;
-                break;
-              }
-            } else {
-              if (accelAwayCount > 0) accelAwayCount--;
-            }
-          }
+          bboxHistory = [];
           alerts.push({ type: 'idle', text: '🚙 行駛中' });
         } else {
           bboxHistory.push({ area, y: smoothedBbox.y, time: now });
@@ -907,9 +909,7 @@ function resetCarState() {
   bboxHistory = [];
   lockCandidate = null;
   lockFrameCount = 0;
-  disappearFrameCount = 0;
-  moveConfirmCount = 0;
-  accelAwayCount = 0;
+  disappearFrameCount = 0;  moveConfirmCount = 0;
 }
 
 // =============================================
@@ -917,7 +917,14 @@ function resetCarState() {
 // =============================================
 function scoreTrafficLight(bbox, vw, vh) {
   const [x, y, w, h] = bbox;
-  return (w * h) / (vw * vh);
+  const areaScore = (w * h) / (vw * vh);
+
+  // --- 水平位置加權（高斯：中央=1）---
+  const cx = (x + w / 2) / vw;
+  const hDev = (cx - 0.5) / 0.3;        // σ=0.3（燈號比車輛允許稍寬）
+  const hWeight = Math.exp(-0.5 * hDev * hDev);
+
+  return areaScore * hWeight;
 }
 
 function findTrafficLight(lights) {
@@ -1032,17 +1039,48 @@ function drawOverlay(predictions, vw, vh) {
     octx.strokeRect(x * sx, y * sy, w * sx, h * sy);
     octx.setLineDash([]);
     octx.fillStyle = '#facc15';
-    octx.font = 'bold 13px sans-serif';
-    octx.fillText('🚦', x * sx, y * sy - 5);
+    octx.font = 'bold 13px sans-serif';    octx.fillText('🚦', x * sx, y * sy - 5);
+  }
+
+  // 車道線繪製 (UFLD)
+  if (lastLanes && lastLanes.length > 0) {
+    for (const lane of lastLanes) {
+      if (lane.length < 2) continue;
+      // 判斷是否為 ego-lane 邊界
+      const isEgo = lastEgoLane &&
+        (lane === lastEgoLane.leftLane || lane === lastEgoLane.rightLane);
+      octx.strokeStyle = isEgo ? 'rgba(74,222,128,0.7)' : 'rgba(255,255,255,0.3)';
+      octx.lineWidth = isEgo ? 3 : 1.5;
+      octx.beginPath();
+      octx.moveTo(lane[0].x * sx, lane[0].y * sy);
+      for (let i = 1; i < lane.length; i++) {
+        octx.lineTo(lane[i].x * sx, lane[i].y * sy);
+      }
+      octx.stroke();
+    }
+    // ego-lane 填色
+    if (lastEgoLane) {
+      octx.fillStyle = 'rgba(74,222,128,0.08)';
+      octx.beginPath();
+      const left = lastEgoLane.leftLane;
+      const right = lastEgoLane.rightLane;
+      // 左側線從上到下
+      octx.moveTo(left[0].x * sx, left[0].y * sy);
+      for (let i = 1; i < left.length; i++) octx.lineTo(left[i].x * sx, left[i].y * sy);
+      // 右側線從下到上
+      for (let i = right.length - 1; i >= 0; i--) octx.lineTo(right[i].x * sx, right[i].y * sy);
+      octx.closePath();
+      octx.fill();
+    }
   }
 
   // 狀態
   octx.font = '11px sans-serif';
   octx.fillStyle = 'rgba(255,255,255,0.4)';
-  const ml = useOnnx ? 'YOLO' : 'COCO';
-  const dl = useMidas ? '+D' : '';
+  const ml = useOnnx ? 'YOLO' : 'COCO';  const dl = useMidas ? '+D' : '';
+  const ll = useUfld ? '+L' : '';
   const sl = egoMoving ? '🚙 行駛中' : `📡 ${sysState.toUpperCase()}`;
-  octx.fillText(`${sl} [${ml}${dl}]`, 8, overlay.height - 8);
+  octx.fillText(`${sl} [${ml}${dl}${ll}]`, 8, overlay.height - 8);
 
   // Debug
   if (debugMode) {
@@ -1093,7 +1131,7 @@ function drawOverlay(predictions, vw, vh) {
     octx.font = '11px monospace';
     const nV = predictions.filter(p => VEHICLE_CLASSES.has(p.classId)).length;
     const nL = predictions.filter(p => p.classId === LIGHT_CLASS).length;
-    octx.fillText(`det:${predictions.length} car:${nV} light:${nL} ${vw}×${vh} ${ml}${dl}`, 8, 16);
+    octx.fillText(`det:${predictions.length} car:${nV} light:${nL} ${vw}×${vh} ${ml}${dl}${ll}`, 8, 16);
   }
 }
 
@@ -1107,12 +1145,10 @@ async function detect() {
   }
   const vw = video.videoWidth, vh = video.videoHeight;
 
-  // 1) 物件偵測（先跑，靜態追蹤需要結果）
+  // 1) 物件偵測
   const predictions = await detectObjects(video);
-
-  // 2) 自車運動（靜態物件追蹤優先，路面光流備援）
-  updateEgoMotion(predictions, vw, vh);
-
+  // 2) 自車運動（GPS 測速）
+  updateEgoMotion();
   // 3) 深度估測（靜止 + 有車輛時才跑，且每 N 幀一次省電）
   if (useMidas && midasSession) {
     const hasVeh = predictions.some(p => VEHICLE_CLASSES.has(p.classId));
@@ -1121,6 +1157,22 @@ async function detect() {
       depthFrameCounter = 0;
       try { lastDepthMap = await midasEstimateDepth(video); }
       catch (e) { lastDepthMap = null; }
+    }
+  }
+
+  // 3.5) 車道線偵測 (UFLD，每 N 幀一次省電)
+  if (useUfld && ufldSession) {
+    ufldFrameCounter++;
+    if (ufldFrameCounter >= UFLD_RUN_EVERY) {
+      ufldFrameCounter = 0;
+      try {
+        lastLanes = await ufldDetectLanes(video);
+        lastEgoLane = findEgoLane(lastLanes, vw, vh);
+      } catch (e) {
+        console.warn('[A-Eye] UFLD 推論失敗:', e.message);
+        lastLanes = null;
+        lastEgoLane = null;
+      }
     }
   }
 
@@ -1159,15 +1211,12 @@ function renderAlerts(alerts) {
 
 function resetAllState() {
   resetCarState();
-  sysState = STATE.IDLE;
-  lockedLight = null;  trafficLightState = 'unknown';
-  lightConfirmCount = 0;
-  prevFlowStrip = null;
-  prevStaticObjects = [];
-  egoMotionHistory = [];
-  lastEgoMethod = 'none';
-  egoMoving = false;
+  sysState = STATE.IDLE;  lockedLight = null;  trafficLightState = 'unknown';
+  lightConfirmCount = 0;  egoMoving = false;
   lastDepthMap = null;
+  lastLanes = null;
+  lastEgoLane = null;
+  ufldFrameCounter = 0;
 }
 
 const BTN_ICON = '<img src="icon-192.png" class="btn-icon">';
