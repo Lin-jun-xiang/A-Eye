@@ -1,5 +1,5 @@
-const CACHE = 'aeye-v3';
-const FILES = ['./', './index.html', './app.js', './manifest.json'];
+const CACHE = 'aeye-v5';
+const FILES = ['./', './index.html', './app.js', './yolo-classes.js', './manifest.json'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)));

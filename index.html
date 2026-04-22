@@ -12,6 +12,8 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
+<script src="yolo-classes.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -112,6 +114,10 @@ body {
 #toggle-btn.stop {
   background: rgba(239, 68, 68, 0.8); color: #fff;
 }
+.btn-icon {
+  width: 22px; height: 22px; vertical-align: middle;
+  margin-right: 4px; border-radius: 4px;
+}
 #pip-btn {
   width: 52px; padding: 14px;
   border: 1px solid rgba(255,255,255,0.2);
@@ -145,14 +151,15 @@ body {
 <div id="status-bar">
   <div id="status-dot" class="inactive"></div>
   <span id="status-text">點擊下方按鈕開始偵測</span>
+  <span id="speed-display" style="margin-left:auto; font-size:14px; font-weight:600; opacity:0.85; display:none;">-- km/h</span>
 </div>
 
 <div id="detection-panel">
   <div id="alerts">
     <div class="alert-badge idle">⏳ 等待啟動...</div>
-  </div>
-  <div id="controls">    <button id="toggle-btn" class="start" onclick="toggleDetection()">▶ 開始偵測</button>
+  </div>  <div id="controls">    <button id="toggle-btn" class="start" onclick="toggleDetection()"><img src="icon-192.png" class="btn-icon"> 開始偵測</button>
     <button id="pip-btn" onclick="togglePiP()" title="子母畫面" style="display:none">🖼</button>
+    <button id="debug-btn" onclick="debugMode=!debugMode;this.style.opacity=debugMode?1:0.4" title="Debug" style="opacity:0.4;background:#333;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;font-size:13px;cursor:pointer">🔍</button>
   </div>
 </div>
 
