@@ -2,14 +2,17 @@
 
 > 📱 PWA 行車輔助 App，利用 YOLOv8n 物件偵測 + MiDaS 深度估測 + GPS 測速，  
 > 在等紅燈時提醒駕駛人：**前車已起步**、**綠燈亮了**。
-
+>
+> - 可於畫面上分別開關 🚗 **前車起步偵測** 與 🚦 **紅綠燈偵測**（偏好會被記住）
+> - 無論紅綠燈與否：前車起步皆須通知
+> - 無論有無前車：紅燈轉綠燈皆須通知
 ---
 
 ## ✨ 功能特色
 
 | 功能 | 說明 |
 |------|------|
-| 🚗 前車起步偵測 | 狀態機追蹤 + EMA 平滑 + 中位數比較，穩定判斷前車移動 |
+| 🚗 前車起步偵測 | YOLO 鎖定 + **OpenCV.js 稀疏光流 (LK)** + 背景抖動扣除 + FOE 徑向投票，只判方向不用閾值 |
 | 🟢 紅綠燈變換提醒 | 紅→綠自動提醒，含色彩分析 |
 | 🚙 自車運動偵測 | GPS 測速，行駛中靜默、靜止時才發通知 |
 | 📏 深度估測 | MiDaS 輔助判斷「最前方」車輛 |
@@ -41,17 +44,17 @@ graph LR
 |------|------|----------|
 | **IDLE** | 無前車 | 偵測到車輛 → LOCKING |
 | **LOCKING** | 候選車確認中 | 連續 3 幀 IoU 匹配 → TRACKING；失敗 → IDLE |
-| **TRACKING** | 追蹤中 | 靜止時面積縮小 >6% 且確認 4 幀 → ⚡ 前車已起步；車輛消失 → DEPARTING；行駛中 → 靜默 |
+| **TRACKING** | 追蹤中 | 靜止時光流多數決連續 3 tick 偵測到「朝 FOE 徑向位移」→ ⚡ 前車已起步；車輛消失 → DEPARTING；行駛中 → 靜默 |
 | **DEPARTING** | 確認離開中 | 車輛重現 → TRACKING；連續 5 幀消失 → ⚡ 前車已駛離 |
 
-> 移動判定使用**中位數比較**（歷史窗口前半 vs 後半），搭配**漸減式確認計數器**（非歸零），提高穩定性。
+> 移動判定使用 **OpenCV.js 稀疏光流（Lucas-Kanade）**：bbox 內撒 Shi-Tomasi 特徵點，背景另撒一組點用中位位移扣掉手機抖動；每點再以 FOE（畫面中央偏上）為圓心取徑向投影符號，多數朝向 FOE（車變遠）即判為起步。**完全不使用像素/百分比閾值**。
 
 ### 通知邏輯
 
 | 自車狀態 | 事件 | 會通知？ |
 |----------|------|----------|
 | 🚗 移動 | 任何事件 | ❌ 全部靜默 |
-| 🛑 靜止 | 前車起步（面積縮小 >6%） | ✅ 會通知 |
+| 🛑 靜止 | 前車起步（光流：朝 FOE 徑向位移多數決） | ✅ 會通知 |
 | 🛑 靜止 | 紅→綠 | ✅ 會通知 |
 | 🛑 靜止 | 前車消失（連續 5 幀） | ✅ 會通知 |
 
@@ -104,13 +107,14 @@ npx serve .
 
 | 參數 | 值 | 說明 |
 |------|----|------|
-| `DETECT_INTERVAL` | 600ms | 偵測間隔 |
+| `DETECT_INTERVAL` | 100ms | 所有判定統一 tick（YOLO / MiDaS / UFLD / 光流） |
 | `EMA_ALPHA` | 0.18 | Bbox 平滑係數（越低越穩） |
-| `MOVE_HISTORY` | 12 幀 | 移動判定窗口 |
-| `MOVE_CONFIRM_FRAMES` | 4 幀 | 起步確認幀數 |
-| `MOVE_ENTER_RATIO` | 6% | 面積縮小門檻 |
+| `OF_INPUT_W × H` | 320×180 | 光流降採樣解析度 |
+| `OF_MAX_FG_POINTS` | 40 | bbox 內光流特徵點上限 |
+| `OF_MAX_BG_POINTS` | 40 | 背景（手機抖動基準）特徵點上限 |
+| `OF_CONFIRM_TICKS` | 3 | 連續 N tick 多數決一致才觸發起步 |
+| `OF_VOTE_MARGIN` | 2 | 朝 FOE 票數 − 遠離 FOE 票數 之最小差距 |
 | `GPS_MOVE_SPEED` | 1.5 m/s | GPS 移動門檻 (~5.4 km/h) |
-| `DEPTH_RUN_EVERY` | 3 幀 | MiDaS 執行頻率（省電） |
 
 ---
 
@@ -119,6 +123,7 @@ npx serve .
 - **ONNX Runtime Web** 1.17.0 — 瀏覽器端 AI 推論（WebGL / WASM）
 - **YOLOv8n** — 即時物件偵測（640×640, 80 類）
 - **MiDaS Small** — 單目深度估測（256×256）
+- **OpenCV.js** 4.9 — LK 稀疏光流（Shi-Tomasi + calcOpticalFlowPyrLK）
 - **TensorFlow.js + COCO-SSD** — 降級備援方案
 - **GPS** (`navigator.geolocation`) — 自車速度偵測
 - **PWA** (Service Worker + Wake Lock + PiP)

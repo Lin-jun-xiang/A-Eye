@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<title>A-Eye｜MiDaS 深度測試 (test.png)</title>
+<style>
+  body { margin: 0; padding: 16px; background: #111; color: #eee; font-family: sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  #info { font-family: monospace; font-size: 12px; background: #000; padding: 8px; border-radius: 4px; white-space: pre; max-width: 900px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+  .card { background: #1a1a1a; padding: 8px; border-radius: 6px; }
+  .card h3 { margin: 0 0 4px; font-size: 13px; font-weight: normal; color: #9ca3af; }
+  canvas { display: block; border: 1px solid #333; image-rendering: pixelated; }
+  button { background: #2563eb; color: white; border: 0; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 8px; }
+  button:disabled { background: #444; cursor: not-allowed; }
+  label { font-size: 12px; color: #9ca3af; margin-right: 8px; }
+</style>
+</head>
+<body>
+
+<h1>MiDaS Small｜深度視覺化測試</h1>
+<div>
+  <button id="run">▶ 執行深度推論</button>
+  <label><input type="checkbox" id="invert"> 反轉顏色（近=暗）</label>
+  <label>取樣點數 <input type="number" id="nPts" value="40" min="5" max="200" style="width:60px;"></label>
+</div>
+<div id="info">等待模型載入...</div>
+
+<div class="row">
+  <div class="card">
+    <h3>原圖 (test.png)</h3>
+    <canvas id="cOrig"></canvas>
+  </div>
+  <div class="card">
+    <h3>深度圖 (灰階, 亮=近)</h3>
+    <canvas id="cGray"></canvas>
+  </div>
+  <div class="card">
+    <h3>深度圖 (彩虹, 紅=近 藍=遠)</h3>
+    <canvas id="cJet"></canvas>
+  </div>
+  <div class="card">
+    <h3>原圖 + 隨機取樣點（顯示深度值）</h3>
+    <canvas id="cPts"></canvas>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
+<script>
+const MIDAS_SIZE = 256;
+const DISPLAY_W = 384;  // 顯示用尺寸
+
+const info = document.getElementById('info');
+const btn = document.getElementById('run');
+const invertCb = document.getElementById('invert');
+const nPtsInput = document.getElementById('nPts');
+
+const cOrig = document.getElementById('cOrig');
+const cGray = document.getElementById('cGray');
+const cJet  = document.getElementById('cJet');
+const cPts  = document.getElementById('cPts');
+
+let session = null;
+let img = null;
+
+function log(msg) { info.textContent = msg; console.log(msg); }
+
+// --- 載入圖片 ---
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const i = new Image();
+    i.crossOrigin = 'anonymous';
+    i.onload = () => resolve(i);
+    i.onerror = reject;
+    i.src = src;
+  });
+}
+
+// --- 前處理（同 app.js） ---
+function preprocess(image) {
+  const c = document.createElement('canvas');
+  c.width = MIDAS_SIZE; c.height = MIDAS_SIZE;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(image, 0, 0, MIDAS_SIZE, MIDAS_SIZE);
+  const pixels = ctx.getImageData(0, 0, MIDAS_SIZE, MIDAS_SIZE).data;
+  const mean = [0.485, 0.456, 0.406];
+  const std  = [0.229, 0.224, 0.225];
+  const N = MIDAS_SIZE * MIDAS_SIZE;
+  const f = new Float32Array(3 * N);
+  for (let i = 0; i < N; i++) {
+    f[i]         = (pixels[i*4]   / 255 - mean[0]) / std[0];
+    f[N + i]     = (pixels[i*4+1] / 255 - mean[1]) / std[1];
+    f[2*N + i]   = (pixels[i*4+2] / 255 - mean[2]) / std[2];
+  }
+  return f;
+}
+
+// --- 彩虹配色 (jet-like) ---
+function jet(t) {
+  // t: 0~1, 回傳 [r,g,b]
+  const r = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4*t - 3))));
+  const g = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4*t - 2))));
+  const b = Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4*t - 1))));
+  return [r, g, b];
+}
+
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m-1] + s[m]) / 2;
+}
+
+// --- 畫原圖 (給定 canvas) ---
+function drawImageScaled(canvas, image) {
+  const ratio = image.naturalHeight / image.naturalWidth;
+  canvas.width = DISPLAY_W;
+  canvas.height = Math.round(DISPLAY_W * ratio);
+  canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+}
+
+// --- 把 depthMap 畫成視覺化 ---
+function renderDepth(canvas, depth, colormap, invert) {
+  // depth: Float32Array(MIDAS_SIZE * MIDAS_SIZE)
+  let dMin = Infinity, dMax = -Infinity;
+  for (let i = 0; i < depth.length; i++) {
+    if (depth[i] < dMin) dMin = depth[i];
+    if (depth[i] > dMax) dMax = depth[i];
+  }
+  const range = (dMax - dMin) || 1;
+
+  // 畫到 256x256 的 ImageData，再 drawImage 縮放到 DISPLAY_W
+  const small = document.createElement('canvas');
+  small.width = MIDAS_SIZE; small.height = MIDAS_SIZE;
+  const sctx = small.getContext('2d');
+  const id = sctx.createImageData(MIDAS_SIZE, MIDAS_SIZE);
+  for (let i = 0; i < depth.length; i++) {
+    let t = (depth[i] - dMin) / range;   // 0~1, 1=近
+    if (invert) t = 1 - t;
+    let r, g, b;
+    if (colormap === 'gray') {
+      const v = Math.round(t * 255);
+      r = g = b = v;
+    } else {
+      [r, g, b] = jet(t);
+    }
+    const idx = i * 4;
+    id.data[idx] = r; id.data[idx+1] = g; id.data[idx+2] = b; id.data[idx+3] = 255;
+  }
+  sctx.putImageData(id, 0, 0);
+
+  canvas.width = DISPLAY_W;
+  canvas.height = Math.round(DISPLAY_W * (img.naturalHeight / img.naturalWidth));
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(small, 0, 0, canvas.width, canvas.height);
+
+  return { dMin, dMax };
+}
+
+// --- 畫隨機取樣點 + 標示深度值 ---
+function drawSamplePoints(canvas, image, depth, nPts) {
+  drawImageScaled(canvas, image);
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // 隨機撒點（在整張圖上）
+  const pts = [];
+  for (let i = 0; i < nPts; i++) {
+    const x = Math.random() * W;
+    const y = Math.random() * H;
+    // 查 MiDaS 深度
+    const mx = Math.floor(x / W * MIDAS_SIZE);
+    const my = Math.floor(y / H * MIDAS_SIZE);
+    const d = depth[my * MIDAS_SIZE + mx];
+    pts.push({ x, y, d });
+  }
+
+  // 統計中位數 / MAD
+  const dVals = pts.map(p => p.d);
+  const dMed = median(dVals);
+  const mad = median(dVals.map(d => Math.abs(d - dMed))) || 1e-6;
+  const K_MAD = 2.5;
+
+  // 正規化顏色
+  let dMin = Infinity, dMax = -Infinity;
+  for (const d of dVals) { if (d < dMin) dMin = d; if (d > dMax) dMax = d; }
+  const range = (dMax - dMin) || 1;
+
+  ctx.font = '9px monospace';
+  for (const p of pts) {
+    const t = (p.d - dMin) / range;
+    const [r, g, b] = jet(t);
+    const isOutlier = Math.abs(p.d - dMed) > K_MAD * mad;
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.strokeStyle = isOutlier ? 'white' : 'black';
+    ctx.lineWidth = isOutlier ? 2 : 1;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, isOutlier ? 5 : 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+  // 標題
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, canvas.width, 18);
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`median=${dMed.toFixed(2)}  MAD=${mad.toFixed(3)}  白圈=|d-median|>${K_MAD}·MAD 離群`, 4, 12);
+
+  return { dMed, mad, nOutlier: pts.filter(p => Math.abs(p.d - dMed) > K_MAD * mad).length };
+}
+
+// --- 主流程 ---
+async function main() {
+  log('① 載入 MiDaS 模型...');
+  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
+  try {    // 注意：WebGL backend 不支援 int64，MiDaS 需要用 wasm
+    session = await ort.InferenceSession.create('./models/midas_small.onnx', {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
+    log('② 模型載入完成，按 [執行深度推論]');
+    btn.disabled = false;
+  } catch (e) {
+    log('❌ 模型載入失敗: ' + e.message);
+    return;
+  }
+
+  log('③ 載入 test.png...');
+  img = await loadImage('./test.png');
+  drawImageScaled(cOrig, img);
+  log(`✅ 就緒｜原圖 ${img.naturalWidth}×${img.naturalHeight}，按 [執行深度推論]`);
+}
+
+async function runInference() {
+  if (!session || !img) return;
+  btn.disabled = true;
+  log('跑推論中...');
+  const t0 = performance.now();
+  const tensor = preprocess(img);
+  const input = new ort.Tensor('float32', tensor, [1, 3, MIDAS_SIZE, MIDAS_SIZE]);
+  const feeds = {};
+  feeds[session.inputNames[0]] = input;
+  const results = await session.run(feeds);
+  const depth = results[session.outputNames[0]].data;
+  const t1 = performance.now();
+
+  const { dMin, dMax } = renderDepth(cGray, depth, 'gray', invertCb.checked);
+  renderDepth(cJet, depth, 'jet', invertCb.checked);
+  const stats = drawSamplePoints(cPts, img, depth, parseInt(nPtsInput.value, 10));
+
+  const dMed = median(Array.from(depth).filter((_, i) => i % 50 === 0)); // 下採樣算中位
+  log(
+`推論耗時 : ${(t1 - t0).toFixed(1)} ms
+深度範圍 : min=${dMin.toFixed(3)}  max=${dMax.toFixed(3)}  range=${(dMax-dMin).toFixed(3)}
+整張中位 : ${dMed.toFixed(3)} (下採樣估計)
+撒點統計 : median=${stats.dMed.toFixed(3)}  MAD=${stats.mad.toFixed(3)}  離群點 ${stats.nOutlier}/${nPtsInput.value}
+輸出尺寸 : ${MIDAS_SIZE}×${MIDAS_SIZE} (Float32)
+提示：MiDaS 是「相對逆深度」，值越大越近。絕對單位無意義，只能比大小。`
+  );
+  btn.disabled = false;
+}
+
+btn.addEventListener('click', runInference);
+invertCb.addEventListener('change', () => { if (session && img) runInference(); });
+main();
+</script>
+
+</body>
+</html>
