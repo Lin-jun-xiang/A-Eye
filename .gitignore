@@ -4,3 +4,5 @@ __pycache__/
 *.pt
 
 third_party/openlenda/
+
+third_party/
