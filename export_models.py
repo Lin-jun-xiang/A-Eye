@@ -1,14 +1,14 @@
 """
 A-Eye 模型匯出腳本
 ==================
-匯出 YOLOv8n 和 MiDaS Small 的 ONNX 模型到 models/ 目錄。
+匯出 YOLOv8s 和 MiDaS Small 的 ONNX 模型到 models/ 目錄。
 
 使用方式：
   pip install ultralytics onnx onnxruntime
   python export_models.py
 
 產出：
-  models/yolov8n.onnx       (~6.2 MB)  — 物件偵測
+  models/yolov8s.onnx       (~22 MB)   — 物件偵測（升級自 yolov8n，召回率↑）
   models/midas_small.onnx   (~17 MB)   — 深度估測
 """
 
@@ -18,20 +18,20 @@ import urllib.request
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ─── YOLOv8n ───────────────────────────────
+# ─── YOLOv8s ───────────────────────────────
 def export_yolo():
-    out = os.path.join(MODELS_DIR, "yolov8n.onnx")
+    out = os.path.join(MODELS_DIR, "yolov8s.onnx")
     if os.path.exists(out):
         print(f"[YOLO] 已存在: {out}")
         return
 
-    print("[YOLO] 匯出 YOLOv8n → ONNX ...")
+    print("[YOLO] 匯出 YOLOv8s → ONNX ...")
     try:
         from ultralytics import YOLO
-        model = YOLO("yolov8n.pt")
+        model = YOLO("yolov8s.pt")
         model.export(format="onnx", imgsz=640, simplify=True, opset=17)
-        # ultralytics exports to ./yolov8n.onnx
-        src = "yolov8n.onnx"
+        # ultralytics exports to ./yolov8s.onnx
+        src = "yolov8s.onnx"
         if os.path.exists(src):
             os.rename(src, out)
             print(f"[YOLO] ✓ 已匯出: {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
@@ -43,10 +43,9 @@ def export_yolo():
         download_yolo_fallback(out)
 
 def download_yolo_fallback(out):
-    """從 HuggingFace 下載預先匯出的 YOLOv8n ONNX"""
+    """從 HuggingFace 下載預先匯出的 YOLOv8s ONNX"""
     urls = [
-        "https://huggingface.co/niconielsen32/yolov8n/resolve/main/yolov8n.onnx",
-        "https://huggingface.co/Xenova/yolov8n/resolve/main/onnx/model.onnx",
+        "https://huggingface.co/Xenova/yolov8s/resolve/main/onnx/model.onnx",
     ]
     for url in urls:
         try:

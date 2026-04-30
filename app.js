@@ -61,31 +61,44 @@ const MOVE_Y_ENTER = 0.025;
 const MOVE_HISTORY = 12;
 const MOVE_CONFIRM_FRAMES = 4;
 
-// ---------- 光流起步判定 (方案 A) ----------
+// ---------- 光流起步判定（v2：仿射 ego-motion 補償 + 證據累積）----------
 // 思路：
-//   1. 鎖定前車 bbox 後，在 bbox 內撒 Shi-Tomasi 特徵點 (前景 points)
-//   2. 在 bbox 外（畫面邊緣/背景）撒一批特徵點 (背景 points)
-//   3. 每 tick 用 LK 光流追蹤兩組點的位移
-//   4. 前景位移 - 背景中位位移 = 扣除手機抖動後的真實前車位移
-//   5. 計算每個前景點的徑向投影：以 FOE (畫面中央偏上) 為圓心，
-//      "朝 FOE 方向" 的位移（徑向 dot < 0）= 車變遠 = 起步
-//   6. 多數決 + 連續 N tick 一致 → 觸發「前車已起步」
-//
-// 完全不使用位移大小百分比/像素閾值，只看「方向符號」與「多數決一致性」。
-const OF_MAX_FG_POINTS   = 60;       // bbox 內最多特徵點（多撒一點，給深度過濾剃除空間）
-const OF_MAX_BG_POINTS   = 40;       // 背景最多特徵點
-const OF_RESAMPLE_EVERY  = 900;      // ms，存活點太少或定期重撒
-const OF_WIN_SIZE        = 15;       // LK window
-const OF_PYR_LEVELS      = 3;        // LK 金字塔
-const OF_MIN_FG_ALIVE    = 10;       // 存活前景點少於此數 → 重撒
-const OF_MIN_VOTE_POINTS = 8;        // 有效點不足則不做判定
-const OF_VOTE_MARGIN     = 2;        // 多數決差距（朝內 − 朝外）至少這麼多票
-const OF_CONFIRM_TICKS   = 3;        // 連續 N tick 判為「起步」
-const OF_BBOX_SHRINK     = 0.12;     // bbox 內縮 12%，避開邊緣抖動
-const OF_INPUT_W         = 320;      // 光流降採樣寬度（加速）
-const OF_INPUT_H         = 180;      // 光流降採樣高度（16:9）
-const OF_FOE_Y_RATIO     = 0.45;     // FOE 預設位置（畫面中央略偏上）
-const OF_DEPTH_MAD_K     = 2.5;      // MiDaS 深度過濾：|d - median| > K·MAD 視為離群（不在車體上）
+//   1. 鎖定前車 bbox 後，bbox 內撒前景點，bbox 外撒背景點
+//   2. 用 LK 光流追蹤兩組點
+//   3. 從背景點的位移用 RANSAC 估計「整張畫面」的相似變換 T
+//      （平移+旋轉+尺度）— 這是手機晃動 / 相機微震的完整模型，
+//      比「扣背景中位數」更穩健，能吃掉 roll、握持微震、focal-length 抖動
+//   4. 把前景點的 prevPts 用 T warp → 預測位置；殘差 = 真實位移
+//   5. 殘差在「以 FOE 為原點」的徑向投影：朝 FOE = 起步證據，反之 = 靠近證據
+//   6. 用序列機率比檢定（SPRT）累積證據：
+//        每點 sign 是一個 Bernoulli 觀測；LLR 累加；
+//        證據強 → 1 tick 就觸發；雜訊 → 自動多看幾幀；
+//        參數只有「可容忍誤警率 α」，不再是「票差≥M、連續≥N tick」這種拍腦袋數字
+const OF_MAX_FG_POINTS   = 60;
+const OF_MAX_BG_POINTS   = 80;       // 背景點多撒一點，仿射估計才穩
+const OF_RESAMPLE_EVERY  = 900;      // ms
+const OF_WIN_SIZE        = 15;
+const OF_PYR_LEVELS      = 3;
+const OF_MIN_FG_ALIVE    = 10;
+const OF_MIN_BG_FOR_AFFINE = 8;      // 仿射估計最少需要的背景點
+const OF_BBOX_SHRINK     = 0.12;
+const OF_INPUT_W         = 320;
+const OF_INPUT_H         = 180;
+const OF_FOE_Y_RATIO     = 0.45;
+const OF_DEPTH_MAD_K     = 2.5;
+
+// SPRT 證據累積參數
+//   H0: p = 0.5 (純雜訊，朝/離 FOE 機率各半)
+//   H1: p = OF_SPRT_P1 (有起步 → 多數朝 FOE)
+//   α  = false alarm 機率（誤警率）
+//   β  = miss 機率（漏報率）
+// 觸發門檻 A = ln((1-β)/α)；重置門檻 B = ln(β/(1-α))
+// 每點貢獻 ±OF_LLR_UNIT；LLR 在中間段持續觀察
+const OF_SPRT_P1     = 0.70;
+const OF_SPRT_ALPHA  = 0.01;
+const OF_SPRT_BETA   = 0.05;
+const OF_RADIAL_DOMINANCE = 1.0;     // |radial| 必須 ≥ |tangential| 才算「徑向票」
+const OF_LLR_DECAY   = 0.85;         // 每 tick 對舊 LLR 的折扣（避免長期累積偏置）
 
 // EMA（更低 = 更平滑，抗抖動）
 const EMA_ALPHA = 0.18;
@@ -153,6 +166,7 @@ let disappearFrameCount = 0;
 let moveConfirmCount = 0;
 let bboxHistory = [];
 let lockCandidate = null;
+let outOfLaneCount = 0;              // 連續多少 tick 偏離自車道
 
 // 紅綠燈
 let lockedLight = null;
@@ -183,7 +197,7 @@ let ofBgPts = null;                  // 背景特徵點 cv.Mat (N×1, CV_32FC2)
 let ofFgAliveMask = null;            // 前景點存活 Uint8Array
 let ofBgAliveMask = null;
 let ofLastResampleTime = 0;
-let ofDepartVote = 0;                // 連續 tick 判為起步的次數
+let ofLLR = 0;                       // SPRT 累積對數似然比；> A 觸發、< B 重置
 let ofLastTickTime = 0;
 let ofBboxAtSample = null;           // 撒點時的 bbox（原始座標）
 // 光流用 canvas（降採樣）
@@ -332,15 +346,23 @@ async function loadModels() {
   // 嘗試載入 YOLOv8n ONNX
   if (typeof ort !== 'undefined') {
     try {
-      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
-
-      statusText.textContent = '載入 YOLOv8n 模型...';
-      yoloSession = await ort.InferenceSession.create('./models/yolov8n.onnx', {
-        executionProviders: ['webgl', 'wasm'],
-        graphOptimizationLevel: 'all',
-      });
+      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';      statusText.textContent = '載入 YOLOv8s 模型...';
+      // 優先用 yolov8s（精準度↑）；找不到再退回 yolov8n
+      try {
+        yoloSession = await ort.InferenceSession.create('./models/yolov8s.onnx', {
+          executionProviders: ['webgl', 'wasm'],
+          graphOptimizationLevel: 'all',
+        });
+        console.log('[A-Eye] YOLOv8s ONNX 載入成功');
+      } catch (e8s) {
+        console.warn('[A-Eye] yolov8s.onnx 不存在，退回 yolov8n:', e8s.message);
+        yoloSession = await ort.InferenceSession.create('./models/yolov8n.onnx', {
+          executionProviders: ['webgl', 'wasm'],
+          graphOptimizationLevel: 'all',
+        });
+        console.log('[A-Eye] YOLOv8n ONNX 載入成功 (fallback)');
+      }
       useOnnx = true;
-      console.log('[A-Eye] YOLOv8n ONNX 載入成功');
 
       // 嘗試載入 MiDaS
       try {
@@ -367,13 +389,11 @@ async function loadModels() {
       } catch (e) {
         console.warn('[A-Eye] UFLD 載入失敗（車道線停用）:', e.message);
         useUfld = false;
-      }
-
-    } catch (e) {
-      console.warn('[A-Eye] YOLOv8n 載入失敗，降級到 COCO-SSD:', e.message);
+      }    } catch (e) {
+      console.warn('[A-Eye] YOLOv8s 載入失敗，降級到 COCO-SSD:', e.message);
       useOnnx = false;
     }
-  }  // Fallback: COCO-SSD（動態載入 TF.js + COCO-SSD）
+  }// Fallback: COCO-SSD（動態載入 TF.js + COCO-SSD）
   if (!useOnnx) {
     statusText.textContent = '載入 COCO-SSD 模型...';
     try {
@@ -384,7 +404,7 @@ async function loadModels() {
     } catch (e2) {
       throw new Error('無法載入任何偵測模型');
     }
-  }  const info = useOnnx ? `YOLOv8n${useMidas ? ' + MiDaS' : ''}${useUfld ? ' + UFLD' : ''}` : 'COCO-SSD';
+  }  const info = useOnnx ? `YOLOv8s${useMidas ? ' + MiDaS' : ''}${useUfld ? ' + UFLD' : ''}` : 'COCO-SSD';
   statusText.textContent = `模型: ${info}`;
 
   // 光流 (OpenCV.js)：非同步載入，不阻斷偵測啟動
@@ -800,7 +820,7 @@ function ofReleaseAll() {
   ofReleaseMat(ofFgPts);    ofFgPts    = null;
   ofReleaseMat(ofBgPts);    ofBgPts    = null;
   ofBboxAtSample = null;
-  ofDepartVote = 0;
+  ofLLR = 0;
   ofLastTickTime = 0;
   ofLastResampleTime = 0;
 }
@@ -959,12 +979,11 @@ function ofTick(bboxRaw, vw, vh) {
     gray.delete();
     return { departed: false, info: 'bbox-too-small' };
   }
-
   // 第一次呼叫：撒點即可
   if (!ofPrevGray) {
     ofResample(gray, bboxLow);
     ofPrevGray = gray;
-    ofDepartVote = 0;
+    ofLLR = 0;
     return { departed: false, info: 'init' };
   }
 
@@ -978,7 +997,7 @@ function ofTick(bboxRaw, vw, vh) {
     if (dCenter > Math.max(bboxLow.w, bboxLow.h) * 0.5) {
       ofResample(gray, bboxLow);
       ofReleaseMat(ofPrevGray); ofPrevGray = gray;
-      ofDepartVote = 0;
+      ofLLR = 0;
       return { departed: false, info: 'bbox-jump' };
     }
   }
@@ -990,71 +1009,96 @@ function ofTick(bboxRaw, vw, vh) {
   let departed = false;
   let info = 'no-vote';
 
-  if (fgRes && bgRes && fgRes.nextPts.rows >= OF_MIN_VOTE_POINTS) {
-    // 背景中位位移 = 手機抖動估計
-    const bgN = bgRes.nextPts.rows;
-    const bgDx = new Array(bgN), bgDy = new Array(bgN);
-    for (let i = 0; i < bgN; i++) {
-      bgDx[i] = bgRes.nextPts.data32F[i * 2]     - bgRes.prevPts.data32F[i * 2];
-      bgDy[i] = bgRes.nextPts.data32F[i * 2 + 1] - bgRes.prevPts.data32F[i * 2 + 1];
-    }
-    const bgMedDx = bgN ? median(bgDx) : 0;
-    const bgMedDy = bgN ? median(bgDy) : 0;
+  if (fgRes && bgRes
+      && fgRes.nextPts.rows >= OF_MIN_FG_ALIVE
+      && bgRes.nextPts.rows >= OF_MIN_BG_FOR_AFFINE) {
 
-    // FOE：畫面中央偏上（可未來改成消失點偵測）
+    // ---- (A) 用背景點估計 ego-motion 仿射變換 (RANSAC) ----
+    // 平移+旋轉+尺度（4 自由度），補償手機晃動 / roll / 焦距微震
+    let M = null;
+    try {
+      M = cv.estimateAffinePartial2D(
+        bgRes.prevPts, bgRes.nextPts,
+        new cv.Mat(), cv.RANSAC, 2.0, 2000, 0.99, 10
+      );
+    } catch (e) { M = null; }
+
+    // 從 M 取出 [a, b, tx; -b, a, ty]；若 M 不存在則退回單位矩陣（無補償）
+    let a = 1, b = 0, tx = 0, ty = 0;
+    if (M && !M.empty() && M.rows === 2 && M.cols === 3) {
+      a  = M.doubleAt(0, 0); b  = M.doubleAt(0, 1); tx = M.doubleAt(0, 2);
+      ty = M.doubleAt(1, 2);
+    }
+    if (M) M.delete();
+
+    // ---- (B) FOE：畫面中央偏上 ----
     const foeX = OF_INPUT_W * 0.5;
     const foeY = OF_INPUT_H * OF_FOE_Y_RATIO;
 
-    // 對每個前景點：
-    //   1) 扣掉背景中位位移 = 真實位移 (dx, dy)
-    //   2) 以 FOE 為原點，算徑向單位向量 r̂
-    //   3) 徑向位移 = (dx, dy) · r̂
-    //      - 徑向 > 0：遠離 FOE → 車變大 → 靠近（未起步）
-    //      - 徑向 < 0：朝向 FOE → 車縮小 → 起步
-    let voteDepart = 0, voteApproach = 0;
+    // ---- (C) 對每個前景點：用 ego-motion warp 預測位置，殘差取徑向 ----
     const fgN = fgRes.nextPts.rows;
+    let voteDepart = 0, voteApproach = 0, used = 0;
     for (let i = 0; i < fgN; i++) {
       const px = fgRes.prevPts.data32F[i * 2];
       const py = fgRes.prevPts.data32F[i * 2 + 1];
       const nx = fgRes.nextPts.data32F[i * 2];
       const ny = fgRes.nextPts.data32F[i * 2 + 1];
-      const dx = (nx - px) - bgMedDx;
-      const dy = (ny - py) - bgMedDy;
+      // ego-motion 預測位置：T(prev)
+      const ex = a * px + b * py + tx;
+      const ey = -b * px + a * py + ty;
+      // 殘差 = 真實位置 − ego-motion 預測（吃掉相機晃動後的真位移）
+      const dx = nx - ex;
+      const dy = ny - ey;
 
-      // 以該點「撒點時位置」到 FOE 的徑向
-      const rx = px - foeX;
-      const ry = py - foeY;
+      // 以該點 prev 位置到 FOE 的徑向
+      const rx = px - foeX, ry = py - foeY;
       const rn = Math.hypot(rx, ry);
       if (rn < 1e-3) continue;
       const radial = (dx * rx + dy * ry) / rn;
+      const tx_ = -ry / rn, ty_ = rx / rn;
+      const tangential = dx * tx_ + dy * ty_;
 
-      // 僅計入有「明確方向」的點（扣掉背景後仍有可察覺位移）
-      // 用「該點位移量 > 背景位移量的自然噪訊」做定性判斷：
-      // 直接以 |radial| > |tangential| * 0.5 或 rn 足夠大即可算一票
-      const tx = -ry / rn, ty = rx / rn;
-      const tangential = dx * tx + dy * ty;
-      const mag = Math.hypot(dx, dy);
-      if (mag < 1e-3) continue;
-      // 方向一致性：徑向分量佔主導（排除純橫向/雜訊）
-      if (Math.abs(radial) <= Math.abs(tangential)) continue;
-
+      // 只計入「徑向佔主導」的點（排除純橫向/雜訊）
+      if (Math.abs(radial) < OF_RADIAL_DOMINANCE * Math.abs(tangential)) continue;
+      used++;
       if (radial < 0) voteDepart++;
       else voteApproach++;
     }
 
-    const totalVotes = voteDepart + voteApproach;
-    info = `fg:${fgN} bg:${bgN} dep:${voteDepart} app:${voteApproach}`;
+    // ---- (D) 序列機率比檢定 (SPRT) 累積證據 ----
+    // 每個徑向票的 sign 是一個 Bernoulli 樣本：
+    //   H0: P(朝FOE) = 0.5（雜訊）
+    //   H1: P(朝FOE) = OF_SPRT_P1（起步）
+    // 單點 LLR：
+    //   朝FOE 一點 → +ln(P1 / 0.5)
+    //   離FOE 一點 → +ln((1-P1) / 0.5)
+    const llrDepart   = Math.log(OF_SPRT_P1   / 0.5);
+    const llrApproach = Math.log((1 - OF_SPRT_P1) / 0.5);
+    const A = Math.log((1 - OF_SPRT_BETA) / OF_SPRT_ALPHA);   // 上門檻 → 觸發
+    const B = Math.log(OF_SPRT_BETA / (1 - OF_SPRT_ALPHA));   // 下門檻 → 重置
 
-    if (totalVotes >= OF_MIN_VOTE_POINTS
-        && (voteDepart - voteApproach) >= OF_VOTE_MARGIN) {
-      ofDepartVote++;
-      if (ofDepartVote >= OF_CONFIRM_TICKS) {
-        departed = true;
-        ofDepartVote = 0;
-      }
+    if (used > 0) {
+      // 折扣舊證據（避免長期偏置）
+      ofLLR = ofLLR * OF_LLR_DECAY
+            + voteDepart * llrDepart
+            + voteApproach * llrApproach;
     } else {
-      if (ofDepartVote > 0) ofDepartVote--;  // 漸減，抗雜訊
+      ofLLR *= OF_LLR_DECAY;
     }
+
+    info = `fg:${fgN} bg:${bgRes.nextPts.rows} u:${used} `
+         + `d:${voteDepart} a:${voteApproach} LLR:${ofLLR.toFixed(2)}`
+         + ` (A=${A.toFixed(2)})`;
+
+    if (ofLLR >= A) {
+      departed = true;
+      ofLLR = 0;
+    } else if (ofLLR <= B) {
+      ofLLR = 0;  // 確認非起步，重置從零累積
+    }
+  } else {
+    // 點數不足 → 證據衰退
+    ofLLR *= OF_LLR_DECAY;
   }
 
   // 更新 prev 為當前灰階；特徵點沿用追蹤到的「新位置」以繼續追下一幀
@@ -1148,6 +1192,42 @@ function updateEgoMotion() {
 // =============================================
 // 前車篩選 — 面積 + 深度 + 車道線加權
 // =============================================
+
+/**
+ * 硬性過濾：bbox 是否有資格當「前車」候選
+ * 規則：
+ *   1. bbox 必須在畫面下半部（避免遠方/天空/招牌誤偵測）
+ *   2. bbox 面積佔比 ≥ 0.5%（避免太遠的小車）
+ *   3. 若有 ego-lane → bbox 底部中心必須在自車道內（laneW > 0）
+ *      若無 ego-lane → 退回中央 60% 區域（軟性備援）
+ * 這些是幾何 / 物理上必要的硬閘，不是憑感覺的閾值。
+ */
+function isFrontCarCandidate(bbox, vw, vh) {
+  const [x, y, w, h] = bbox;
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+
+  // (1) 中心點 y 必須在畫面下半（前車一定在地平線下方）
+  if (cy / vh < 0.4) return false;
+
+  // (2) 面積太小（過遠）→ 排除
+  const areaRatio = (w * h) / (vw * vh);
+  if (areaRatio < 0.005) return false;
+
+  // (3) 車道硬閘
+  if (lastEgoLane) {
+    const lw = egoLaneWeight(bbox, lastEgoLane, vh);
+    // 在車道內 (lw === 1.0) 或邊緣外少量 (lw > ~0.4)：放行
+    // 偏離車道太多 → 排除（大概率是旁車道車）
+    if (lw === null || lw < 0.4) return false;
+  } else {
+    // 無車道線：退回中央 60% 區域
+    const cxNorm = cx / vw;
+    if (cxNorm < 0.2 || cxNorm > 0.8) return false;
+  }
+  return true;
+}
+
 function scoreFrontCar(bbox, vw, vh, depthMap) {
   const [x, y, w, h] = bbox;
   const areaScore = (w * h) / (vw * vh);
@@ -1182,17 +1262,31 @@ function scoreFrontCar(bbox, vw, vh, depthMap) {
 // =============================================
 function updateCarTracking(vehicles, vw, vh, depthMap) {
   const alerts = [];
-
-  switch (sysState) {
-
-    case STATE.IDLE: {
+  switch (sysState) {    case STATE.IDLE: {
       if (vehicles.length === 0) break;
-      let best = null, bestS = 0;
-      for (const v of vehicles) {
-        const s = scoreFrontCar(v.bbox, vw, vh, depthMap);
-        if (s > bestS) { bestS = s; best = v; }
+      // 1) 硬性過濾：位置/大小/車道
+      const cands = vehicles.filter(v => isFrontCarCandidate(v.bbox, vw, vh));
+      if (cands.length === 0) break;
+
+      // 2) 排序策略：
+      //    - 有 MiDaS 深度圖：直接挑「深度最近」（深度值最大者）— 純模型輸出
+      //    - 無深度圖：退回 scoreFrontCar 軟分數（面積×中心高斯）
+      let best = null;
+      if (depthMap) {
+        let bestDepth = -Infinity;
+        for (const v of cands) {
+          const d = getDepthForBbox(depthMap, v.bbox, vw, vh);
+          if (d > bestDepth) { bestDepth = d; best = v; }
+        }
+      } else {
+        let bestS = 0;
+        for (const v of cands) {
+          const s = scoreFrontCar(v.bbox, vw, vh, depthMap);
+          if (s > bestS) { bestS = s; best = v; }
+        }
       }
-      if (best && bestS > (depthMap ? 0.5 : 0.002)) {
+
+      if (best) {
         const [x, y, w, h] = best.bbox;
         lockCandidate = { x, y, w, h };
         lockFrameCount = 1;
@@ -1237,6 +1331,23 @@ function updateCarTracking(vehicles, vw, vh, depthMap) {
       }      if (matched && bestIoU > IOU_LOCK_MATCH) {
         disappearFrameCount = 0;
         smoothedBbox = emaSmooth(smoothedBbox, matched, EMA_ALPHA);
+
+        // 換道車保護：若已偏離自車道太久 → 視為旁車道車，丟棄不通知
+        if (lastEgoLane) {
+          const lw = egoLaneWeight(
+            [smoothedBbox.x, smoothedBbox.y, smoothedBbox.w, smoothedBbox.h],
+            lastEgoLane, vh
+          );
+          if (lw !== null && lw < 0.4) outOfLaneCount++;
+          else outOfLaneCount = 0;
+          if (outOfLaneCount >= 8) {  // 連續 ~800ms 偏離 → 換道車
+            resetCarState();
+            sysState = STATE.IDLE;
+            alerts.push({ type: 'idle', text: '🚗 已偏離車道，重新尋找前車' });
+            break;
+          }
+        }
+
         if (egoMoving) {
           alerts.push({ type: 'idle', text: '🚙 行駛中' });
         } else {
@@ -1290,6 +1401,7 @@ function resetCarState() {
   lockCandidate = null;
   lockFrameCount = 0;
   disappearFrameCount = 0;  moveConfirmCount = 0;
+  outOfLaneCount = 0;
 }
 
 // =============================================

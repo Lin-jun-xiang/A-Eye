@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A-Eye｜OpenLenda 紅綠燈偵測測試</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: #0f172a; color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #94a3b8; margin-bottom: 16px; }
+  code { background: #1e293b; padding: 1px 4px; border-radius: 3px; }
+  .panel { background: #1e293b; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  button, label.file-btn {
+    background: #2563eb; color: white; border: 0;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer;
+    font-size: 13px; display: inline-block;
+  }
+  button:disabled { background: #475569; cursor: not-allowed; }
+  label.file-btn input { display: none; }
+  input[type="number"] {
+    background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+    padding: 4px 6px; border-radius: 4px; width: 70px;
+  }
+  select {
+    background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+    padding: 4px 6px; border-radius: 4px;
+  }
+  .param { font-size: 12px; color: #94a3b8; }
+  #status {
+    font-family: "Consolas", monospace; font-size: 12px;
+    background: #000; color: #22d3ee; padding: 8px; border-radius: 4px;
+    white-space: pre-wrap; min-height: 1.4em;
+  }
+  .result-wrap {
+    position: relative; display: inline-block;
+    background: #000; border: 1px solid #334155; border-radius: 6px;
+    overflow: hidden; max-width: 100%;
+  }
+  .result-wrap img, .result-wrap canvas {
+    display: block; max-width: 100%; height: auto;
+  }
+  .result-wrap canvas {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #334155; }
+  th { color: #94a3b8; font-weight: normal; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 12px; font-weight: bold; color: white;
+  }
+  details { margin-top: 12px; }
+  details summary { cursor: pointer; color: #94a3b8; font-size: 12px; padding: 4px 0; }
+  pre {
+    background: #000; padding: 8px; border-radius: 4px;
+    font-size: 11px; overflow: auto; max-height: 240px;
+  }
+</style>
+</head>
+<body>
+
+<h1>🚦 OpenLenda 紅綠燈偵測測試</h1>
+<div class="sub">
+  模型：<code>OpenLenda-S</code>（YOLOX-S, 8 類：red / green / yellow / empty / straight / left / right / other）<br>
+  載入檔：<code>./models/openlenda_s.onnx</code>
+  ｜請先用 <code>tools/export_onnx.py --decode_in_inference</code> 匯出。
+</div>
+
+<div class="panel">
+  <div class="row">
+    <label class="file-btn">
+      📁 選擇圖片
+      <input type="file" id="file" accept="image/*">
+    </label>
+    <button id="useSample">📷 使用 test.png</button>
+    <button id="rerun" disabled>🔁 重新分析</button>
+    <span class="param">
+      輸入尺寸
+      <select id="inputSize">
+        <option value="640" selected>640×640</option>
+        <option value="416">416×416</option>
+        <option value="1280">1280×1280</option>
+      </select>
+    </span>
+    <span class="param">
+      conf ≥
+      <input type="number" id="conf" value="0.30" step="0.05" min="0.05" max="0.95">
+      　IoU
+      <input type="number" id="iou" value="0.45" step="0.05" min="0.1" max="0.9">
+    </span>
+  </div>
+</div>
+
+<div class="panel">
+  <div id="status">等待模型載入...</div>
+</div>
+
+<div class="panel">
+  <h3 style="margin:0 0 8px; font-size:14px;">結果</h3>
+  <div class="result-wrap" id="wrap">
+    <img id="img" alt="">
+    <canvas id="overlay"></canvas>
+  </div>
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>#</th><th>類別</th><th>信心</th><th>bbox (x,y,w,h)</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <details>
+    <summary>Debug 訊息</summary>
+    <pre id="debug"></pre>
+  </details>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
+<script>
+// =============================================
+// OpenLenda 參數
+// =============================================
+const CLASS_NAMES = ["red", "green", "yellow", "empty", "straight", "left", "right", "other"];
+const NUM_CLASSES = CLASS_NAMES.length;
+const STRIDES = [8, 16, 32];     // YOLOX FPN 三層
+const PAD_VALUE = 114;           // YOLOX letterbox 填補
+const MODEL_PATH = './models/openlenda_s.onnx';
+
+// 類別顏色（UI 顯示用）
+const CLASS_COLORS = {
+  red:      '#ef4444',
+  green:    '#22c55e',
+  yellow:   '#eab308',
+  empty:    '#64748b',
+  straight: '#3b82f6',
+  left:     '#a855f7',
+  right:    '#ec4899',
+  other:    '#94a3b8',
+};
+
+// =============================================
+// DOM
+// =============================================
+const statusEl  = document.getElementById('status');
+const debugEl   = document.getElementById('debug');
+const fileEl    = document.getElementById('file');
+const sampleBtn = document.getElementById('useSample');
+const rerunBtn  = document.getElementById('rerun');
+const confEl    = document.getElementById('conf');
+const iouEl     = document.getElementById('iou');
+const sizeSel   = document.getElementById('inputSize');
+const imgEl     = document.getElementById('img');
+const overlay   = document.getElementById('overlay');
+const tblBody   = document.querySelector('#tbl tbody');
+const octx      = overlay.getContext('2d');
+
+let session = null;
+let modelReadyPromise = null;
+let currentImage = null;
+
+const log   = m => { statusEl.textContent = m; };
+const dlog  = m => { debugEl.textContent += m + '\n'; };
+const dclear= () => { debugEl.textContent = ''; };
+
+// =============================================
+// 載入 ONNX
+// =============================================
+async function loadModel() {
+  log('載入 OpenLenda ONNX (' + MODEL_PATH + ')...');
+  try {
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
+    try {
+      session = await ort.InferenceSession.create(MODEL_PATH, {
+        executionProviders: ['webgl', 'wasm'],
+        graphOptimizationLevel: 'all',
+      });
+    } catch (e1) {
+      console.warn('[openlenda] WebGL 失敗，退回 wasm:', e1.message);
+      session = await ort.InferenceSession.create(MODEL_PATH, {
+        executionProviders: ['wasm'],
+        graphOptimizationLevel: 'all',
+      });
+    }
+    log(`✅ 模型就緒｜input=${session.inputNames[0]} output=${session.outputNames[0]}\n請選擇圖片`);
+  } catch (e) {
+    log('❌ 模型載入失敗: ' + e.message
+      + '\n請先用 tools/export_onnx.py --decode_in_inference 匯出模型到 models/openlenda_s.onnx，並用本地伺服器開啟本頁');
+    throw e;
+  }
+}
+
+// =============================================
+// YOLOX Preprocess：letterbox + BGR + CHW (無正規化)
+// =============================================
+function preprocess(image, inputSize) {
+  const vw = image.naturalWidth, vh = image.naturalHeight;
+  const c = document.createElement('canvas');
+  c.width = inputSize; c.height = inputSize;
+  const cx = c.getContext('2d');
+
+  // 填 114 (YOLOX 官方 preproc 使用 114 作為 pad value)
+  cx.fillStyle = `rgb(${PAD_VALUE},${PAD_VALUE},${PAD_VALUE})`;
+  cx.fillRect(0, 0, inputSize, inputSize);
+
+  // letterbox：按比例縮放，貼到左上角（對齊 YOLOX preproc）
+  const r = Math.min(inputSize / vh, inputSize / vw);
+  const nw = Math.round(vw * r);
+  const nh = Math.round(vh * r);
+  cx.drawImage(image, 0, 0, vw, vh, 0, 0, nw, nh);
+
+  const pixels = cx.getImageData(0, 0, inputSize, inputSize).data;
+  const total = inputSize * inputSize;
+  // YOLOX 訓練/推論預設是 BGR (因為 cv2 讀圖)，所以這裡要 swap
+  // channel 順序：[B, G, R]
+  const f32 = new Float32Array(3 * total);
+  for (let i = 0; i < total; i++) {
+    const r_ = pixels[i * 4];
+    const g_ = pixels[i * 4 + 1];
+    const b_ = pixels[i * 4 + 2];
+    f32[i]             = b_;                // B
+    f32[total + i]     = g_;                // G
+    f32[2 * total + i] = r_;                // R
+  }
+  return { tensor: f32, ratio: r };
+}
+
+// =============================================
+// YOLOX Decode：把 raw grid 預測 → 實際像素 bbox
+// 若 decode_in_inference=True，ONNX 輸出已經是 decode 過的；
+// 此函數也能「偵測」已解碼並直接回傳。
+// =============================================
+function decodeYoloxOutputs(outputTensor, inputSize) {
+  // outputTensor.dims 可能為 [1, N, 5+nc] 或 [1, 5+nc, N]
+  const dims = outputTensor.dims;
+  const data = outputTensor.data;
+  const stride = 5 + NUM_CLASSES;
+
+  let N, getRow;
+  if (dims.length === 3 && dims[2] === stride) {
+    // [1, N, 13]
+    N = dims[1];
+    getRow = (i) => {
+      const off = i * stride;
+      return data.subarray(off, off + stride);
+    };
+  } else if (dims.length === 3 && dims[1] === stride) {
+    // [1, 13, N]
+    N = dims[2];
+    getRow = (i) => {
+      const row = new Float32Array(stride);
+      for (let k = 0; k < stride; k++) row[k] = data[k * N + i];
+      return row;
+    };
+  } else {
+    throw new Error('未知 output shape: ' + JSON.stringify(dims));
+  }
+
+  // 產生 YOLOX 各層 grid / stride（先判斷「是否已 decode」：
+  // 已 decode 時 cx/cy 會是 0..inputSize 的大值；未 decode 則是小偏移。
+  // 以第 0 行估測：已 decode 的 cx 通常 > 10）
+  let gridXs = null, gridYs = null, strideArr = null;
+  // 預產生 grid
+  const hsizes = [], wsizes = [];
+  let totalGrid = 0;
+  for (const s of STRIDES) {
+    const hs = Math.floor(inputSize / s), ws = Math.floor(inputSize / s);
+    hsizes.push(hs); wsizes.push(ws);
+    totalGrid += hs * ws;
+  }
+  const needDecode = totalGrid === N;
+  if (needDecode) {
+    gridXs = new Float32Array(N);
+    gridYs = new Float32Array(N);
+    strideArr = new Float32Array(N);
+    let idx = 0;
+    for (let li = 0; li < STRIDES.length; li++) {
+      const s = STRIDES[li], hs = hsizes[li], ws = wsizes[li];
+      for (let yy = 0; yy < hs; yy++) {
+        for (let xx = 0; xx < ws; xx++) {
+          gridXs[idx] = xx; gridYs[idx] = yy; strideArr[idx] = s; idx++;
+        }
+      }
+    }
+  }
+
+  // 先決定「到底要不要 decode」：若 decode_in_inference=True，ONNX 已輸出像素座標。
+  // 嘗試看第一行前四維的數量級判定：>= 輸入尺寸的 0.1 表示已像素化
+  const sample = getRow(0);
+  const alreadyDecoded = !needDecode || (Math.abs(sample[0]) > inputSize * 0.05 || Math.abs(sample[2]) > inputSize * 0.05);
+
+  const boxes = [];
+  for (let i = 0; i < N; i++) {
+    const r = getRow(i);
+    const obj = r[4];
+    if (obj < 1e-4) continue;
+    // 找最大類別
+    let maxS = 0, maxC = 0;
+    for (let c = 0; c < NUM_CLASSES; c++) {
+      const s = r[5 + c];
+      if (s > maxS) { maxS = s; maxC = c; }
+    }
+    const score = obj * maxS;
+    if (score < 0.01) continue; // 低成本初篩
+
+    let cx, cy, w, h;
+    if (alreadyDecoded) {
+      cx = r[0]; cy = r[1]; w = r[2]; h = r[3];
+    } else {
+      const s = strideArr[i];
+      cx = (r[0] + gridXs[i]) * s;
+      cy = (r[1] + gridYs[i]) * s;
+      w  = Math.exp(r[2]) * s;
+      h  = Math.exp(r[3]) * s;
+    }
+    const x = cx - w / 2, y = cy - h / 2;
+    boxes.push({ x, y, w, h, score, classId: maxC });
+  }
+  return { boxes, alreadyDecoded };
+}
+
+// =============================================
+// 後處理：把 letterbox 座標 → 原圖座標；NMS
+// =============================================
+function iouXYWH(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w);
+  const y2 = Math.min(a.y + a.h, b.y + b.h);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return inter / (a.w * a.h + b.w * b.h - inter || 1);
+}
+
+function nms(boxes, iouThresh, classAware = true) {
+  boxes.sort((a, b) => b.score - a.score);
+  const keep = [];
+  const sup = new Set();
+  for (let i = 0; i < boxes.length; i++) {
+    if (sup.has(i)) continue;
+    keep.push(boxes[i]);
+    for (let j = i + 1; j < boxes.length; j++) {
+      if (sup.has(j)) continue;
+      if (classAware && boxes[i].classId !== boxes[j].classId) continue;
+      if (iouXYWH(boxes[i], boxes[j]) > iouThresh) sup.add(j);
+    }
+  }
+  return keep;
+}
+
+// =============================================
+// 主偵測流程
+// =============================================
+async function detect(image, inputSize, confThresh, iouThresh) {
+  const { tensor, ratio } = preprocess(image, inputSize);
+  const input = new ort.Tensor('float32', tensor, [1, 3, inputSize, inputSize]);
+  const feeds = {}; feeds[session.inputNames[0]] = input;
+  const t0 = performance.now();
+  const results = await session.run(feeds);
+  const t1 = performance.now();
+  const output = results[session.outputNames[0]];
+  dlog(`Output dims: [${output.dims.join(', ')}]`);
+
+  const { boxes, alreadyDecoded } = decodeYoloxOutputs(output, inputSize);
+  dlog(`alreadyDecoded = ${alreadyDecoded}｜raw boxes = ${boxes.length}`);
+
+  // 套 conf threshold
+  const filtered = boxes.filter(b => b.score >= confThresh);
+  // NMS
+  const kept = nms(filtered, iouThresh);
+  // 座標 letterbox → 原圖
+  const vw = image.naturalWidth, vh = image.naturalHeight;
+  for (const b of kept) {
+    b.x = b.x / ratio;
+    b.y = b.y / ratio;
+    b.w = b.w / ratio;
+    b.h = b.h / ratio;
+    // clamp
+    if (b.x < 0) { b.w += b.x; b.x = 0; }
+    if (b.y < 0) { b.h += b.y; b.y = 0; }
+    if (b.x + b.w > vw) b.w = vw - b.x;
+    if (b.y + b.h > vh) b.h = vh - b.y;
+    b.cls = CLASS_NAMES[b.classId];
+  }
+  return { kept, inferMs: t1 - t0 };
+}
+
+// =============================================
+// 繪製
+// =============================================
+function drawOverlay(image, dets) {
+  overlay.width  = image.naturalWidth;
+  overlay.height = image.naturalHeight;
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+
+  const fontSize = Math.max(14, image.naturalHeight / 40);
+  dets.forEach((d, i) => {
+    const col = CLASS_COLORS[d.cls] || '#a3a3a3';
+    octx.strokeStyle = col;
+    octx.lineWidth = Math.max(2, Math.min(image.naturalWidth, image.naturalHeight) / 300);
+    octx.strokeRect(d.x, d.y, d.w, d.h);
+
+    const label = `#${i + 1} ${d.cls} ${Math.round(d.score * 100)}%`;
+    octx.font = `bold ${fontSize}px sans-serif`;
+    const textW = octx.measureText(label).width;
+    const textH = fontSize + 4;
+    octx.fillStyle = col;
+    octx.fillRect(d.x, Math.max(0, d.y - textH), textW + 10, textH);
+    octx.fillStyle = '#000';
+    octx.fillText(label, d.x + 5, Math.max(textH - 4, d.y - 4));
+  });
+}
+
+function renderTable(dets) {
+  if (!dets.length) {
+    tblBody.innerHTML = `<tr><td colspan="4" style="color:#94a3b8">未偵測到任何紅綠燈</td></tr>`;
+    return;
+  }
+  tblBody.innerHTML = dets.map((d, i) => {
+    const col = CLASS_COLORS[d.cls] || '#a3a3a3';
+    return `<tr>
+      <td>${i + 1}</td>
+      <td><span class="badge" style="background:${col}">${d.cls.toUpperCase()}</span></td>
+      <td>${(d.score * 100).toFixed(1)}%</td>
+      <td>${Math.round(d.x)}, ${Math.round(d.y)}, ${Math.round(d.w)}, ${Math.round(d.h)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// =============================================
+// 入口
+// =============================================
+async function runAnalysis() {
+  if (!session) {
+    if (modelReadyPromise) {
+      log('⏳ 模型仍在載入，請稍候...');
+      try { await modelReadyPromise; } catch { return; }
+    } else { log('模型尚未就緒'); return; }
+  }
+  if (!currentImage) { log('請先選擇圖片'); return; }
+
+  rerunBtn.disabled = true;
+  dclear();
+  const inputSize  = parseInt(sizeSel.value, 10) || 640;
+  const confThresh = parseFloat(confEl.value) || 0.3;
+  const iouThresh  = parseFloat(iouEl.value)  || 0.45;
+
+  log(`推論中...（${currentImage.naturalWidth}×${currentImage.naturalHeight}, tsize=${inputSize}, conf≥${confThresh}, iou=${iouThresh}）`);
+  let dets, inferMs;
+  try {
+    const res = await detect(currentImage, inputSize, confThresh, iouThresh);
+    dets = res.kept;
+    inferMs = res.inferMs;
+  } catch (e) {
+    log('❌ 推論失敗: ' + e.message);
+    console.error(e);
+    rerunBtn.disabled = false;
+    return;
+  }
+
+  drawOverlay(currentImage, dets);
+  renderTable(dets);
+
+  // 摘要
+  const summary = dets.reduce((a, d) => {
+    a[d.cls] = (a[d.cls] || 0) + 1; return a;
+  }, {});
+  const parts = Object.entries(summary).map(([k, v]) => `${k}:${v}`).join(' ');
+  log(`✅ 完成｜推論 ${inferMs.toFixed(0)} ms｜共 ${dets.length} 個燈${parts ? ` (${parts})` : ''}`);
+  dets.forEach((d, i) => {
+    dlog(`  [${i}] ${d.cls}(${d.classId}) ${(d.score * 100).toFixed(1)}%  bbox=${[d.x, d.y, d.w, d.h].map(v => v.toFixed(0)).join(',')}`);
+  });
+
+  rerunBtn.disabled = false;
+}
+
+function setImageFromSrc(src) {
+  log('載入圖片中...');
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = async () => {
+    currentImage = img;
+    imgEl.src = src;
+    overlay.width  = img.naturalWidth;
+    overlay.height = img.naturalHeight;
+    await runAnalysis();
+  };
+  img.onerror = () => log('❌ 圖片載入失敗: ' + src);
+  img.src = src;
+}
+
+// 事件
+fileEl.addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  setImageFromSrc(URL.createObjectURL(f));
+});
+sampleBtn.addEventListener('click', () => setImageFromSrc('test.png'));
+rerunBtn.addEventListener('click', runAnalysis);
+[confEl, iouEl, sizeSel].forEach(el => {
+  el.addEventListener('change', () => { if (currentImage) runAnalysis(); });
+});
+
+// 啟動
+modelReadyPromise = loadModel();
+modelReadyPromise.catch(() => {});
+</script>
+</body>
+</html>
