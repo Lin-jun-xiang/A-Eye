@@ -12,23 +12,81 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
 <script src="yolo-classes.js"></script>
-<!-- Eruda Mobile DevTools: 在網址加 ?debug=1 即可啟用手機版 console -->
+<!-- 開發工具：?debug=1 啟用 Eruda 手機版 console；?reset=1 清除所有快取 / SW -->
 <script>
   (function () {
-    try {
-      var params = new URLSearchParams(location.search);
-      if (params.get('debug') === '1' || location.hash.includes('debug')) {
-        var s = document.createElement('script');
-        s.src = 'https://cdn.jsdelivr.net/npm/eruda';
-        s.onload = function () {
-          if (window.eruda) {
-            eruda.init();
-            console.log('[A-Eye] Eruda DevTools 已啟用 (debug mode)');
-          }
-        };
-        document.head.appendChild(s);
+    var params;
+    try { params = new URLSearchParams(location.search); } catch (_) { params = null; }
+    if (!params) return;
+
+    // === 一鍵清除：?reset=1 ===
+    if (params.get('reset') === '1') {
+      document.documentElement.innerHTML =
+        '<body style="background:#0a0a0a;color:#fff;font-family:sans-serif;padding:24px;line-height:1.6">' +
+        '<h2>🧹 正在清除快取與 Service Worker...</h2>' +
+        '<pre id="log" style="font-size:12px;opacity:0.8;white-space:pre-wrap"></pre></body>';
+      var logEl = document.getElementById('log');
+      var log = function (m) { if (logEl) logEl.textContent += m + '\n'; };
+
+      var tasks = [];
+
+      // 1) 註銷所有 Service Worker（先檢查存在）
+      if ('serviceWorker' in navigator && navigator.serviceWorker &&
+          typeof navigator.serviceWorker.getRegistrations === 'function') {
+        tasks.push(
+          navigator.serviceWorker.getRegistrations()
+            .then(function (rs) {
+              log('找到 ' + rs.length + ' 個 Service Worker');
+              return Promise.all(rs.map(function (r) {
+                return r.unregister().then(function (ok) {
+                  log('  unregister: ' + (r.scope || '?') + ' = ' + ok);
+                });
+              }));
+            }).catch(function (e) { log('SW 清除錯誤: ' + e.message); })
+        );
+      } else {
+        log('navigator.serviceWorker 不可用（略過）');
       }
-    } catch (e) { /* ignore */ }
+
+      // 2) 清除所有 Cache Storage
+      if (typeof caches !== 'undefined' && caches.keys) {
+        tasks.push(
+          caches.keys().then(function (ks) {
+            log('找到 ' + ks.length + ' 個 cache');
+            return Promise.all(ks.map(function (k) {
+              return caches.delete(k).then(function (ok) {
+                log('  delete cache: ' + k + ' = ' + ok);
+              });
+            }));
+          }).catch(function (e) { log('cache 清除錯誤: ' + e.message); })
+        );
+      }
+
+      // 3) 清除 storage
+      try { localStorage.clear(); log('localStorage 已清除'); } catch (_) {}
+      try { sessionStorage.clear(); log('sessionStorage 已清除'); } catch (_) {}
+
+      Promise.all(tasks).then(function () {
+        log('\n✅ 完成！3 秒後重新載入...');
+        setTimeout(function () {
+          location.replace(location.pathname);
+        }, 3000);
+      });
+      return; // 不要繼續載入 app
+    }
+
+    // === Eruda Mobile DevTools：?debug=1 ===
+    if (params.get('debug') === '1' || (location.hash || '').indexOf('debug') >= 0) {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/eruda';
+      s.onload = function () {
+        if (window.eruda) {
+          eruda.init();
+          console.log('[A-Eye] Eruda DevTools 已啟用 (debug mode)');
+        }
+      };
+      document.head.appendChild(s);
+    }
   })();
 </script>
 <style>
