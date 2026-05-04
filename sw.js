@@ -1,4 +1,4 @@
-const CACHE = 'aeye-v6-of';
+const CACHE = 'aeye-v7-wasm';
 const FILES = ['./', './index.html', './app.js', './yolo-classes.js', './manifest.json'];
 
 self.addEventListener('install', e => {

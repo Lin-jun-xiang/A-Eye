@@ -346,20 +346,36 @@ async function loadModels() {
   // 嘗試載入 YOLOv8n ONNX
   if (typeof ort !== 'undefined') {
     try {
-      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';      statusText.textContent = '載入 YOLOv8s 模型...';
+      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
+      // 啟用多執行緒 + SIMD（行動裝置加速）
+      try {
+        ort.env.wasm.numThreads = Math.min(4, (navigator.hardwareConcurrency || 4));
+        ort.env.wasm.simd = true;
+      } catch (_) { /* ignore */ }
+      statusText.textContent = '載入 YOLOv8s 模型...';
+      // YOLOv8 用 opset17，WebGL backend 不支援部分算子（Split 等），只能用 wasm
+      // 自動退回機制：webgl 失敗 → wasm
+      const tryCreate = async (path) => {
+        try {
+          return await ort.InferenceSession.create(path, {
+            executionProviders: ['webgl'],
+            graphOptimizationLevel: 'all',
+          });
+        } catch (eWebgl) {
+          console.warn(`[A-Eye] ${path} WebGL 失敗，改用 WASM:`, eWebgl.message);
+          return await ort.InferenceSession.create(path, {
+            executionProviders: ['wasm'],
+            graphOptimizationLevel: 'all',
+          });
+        }
+      };
       // 優先用 yolov8s（精準度↑）；找不到再退回 yolov8n
       try {
-        yoloSession = await ort.InferenceSession.create('./models/yolov8s.onnx', {
-          executionProviders: ['webgl', 'wasm'],
-          graphOptimizationLevel: 'all',
-        });
+        yoloSession = await tryCreate('./models/yolov8s.onnx');
         console.log('[A-Eye] YOLOv8s ONNX 載入成功');
       } catch (e8s) {
-        console.warn('[A-Eye] yolov8s.onnx 不存在，退回 yolov8n:', e8s.message);
-        yoloSession = await ort.InferenceSession.create('./models/yolov8n.onnx', {
-          executionProviders: ['webgl', 'wasm'],
-          graphOptimizationLevel: 'all',
-        });
+        console.warn('[A-Eye] yolov8s.onnx 載入失敗，退回 yolov8n:', e8s.message);
+        yoloSession = await tryCreate('./models/yolov8n.onnx');
         console.log('[A-Eye] YOLOv8n ONNX 載入成功 (fallback)');
       }
       useOnnx = true;
@@ -375,15 +391,10 @@ async function loadModels() {
         console.log('[A-Eye] MiDaS Small ONNX 載入成功');      } catch (e) {
         console.warn('[A-Eye] MiDaS 載入失敗（深度停用）:', e.message);
         useMidas = false;
-      }
-
-      // 嘗試載入 UFLD (Ultra-Fast-Lane-Detection)
+      }      // 嘗試載入 UFLD (Ultra-Fast-Lane-Detection)
       try {
         statusText.textContent = '載入車道線模型...';
-        ufldSession = await ort.InferenceSession.create('./models/ufld_tusimple.onnx', {
-          executionProviders: ['webgl', 'wasm'],
-          graphOptimizationLevel: 'all',
-        });
+        ufldSession = await tryCreate('./models/ufld_tusimple.onnx');
         useUfld = true;
         console.log('[A-Eye] UFLD ONNX 載入成功');
       } catch (e) {
