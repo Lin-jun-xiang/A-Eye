@@ -12,6 +12,25 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
 <script src="yolo-classes.js"></script>
+<!-- Eruda Mobile DevTools: 在網址加 ?debug=1 即可啟用手機版 console -->
+<script>
+  (function () {
+    try {
+      var params = new URLSearchParams(location.search);
+      if (params.get('debug') === '1' || location.hash.includes('debug')) {
+        var s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/eruda';
+        s.onload = function () {
+          if (window.eruda) {
+            eruda.init();
+            console.log('[A-Eye] Eruda DevTools 已啟用 (debug mode)');
+          }
+        };
+        document.head.appendChild(s);
+      }
+    } catch (e) { /* ignore */ }
+  })();
+</script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
