@@ -1,143 +1,258 @@
-# A-Eye v6 — AI 駕駛起步警示系統
+# A-Eye v7 — AI 駕駛起步警示系統
 
-> 📱 PWA 行車輔助 App，利用 YOLOv8n 物件偵測 + MiDaS 深度估測 + GPS 測速，  
-> 在等紅燈時提醒駕駛人：**前車已起步**、**綠燈亮了**。
+> 📱 PWA 行車輔助 App。等紅燈時提醒駕駛人：**前車已起步**、**綠燈亮了**。
 >
-> - 可於畫面上分別開關 🚗 **前車起步偵測** 與 🚦 **紅綠燈偵測**（偏好會被記住）
-> - 無論紅綠燈與否：前車起步皆須通知
-> - 無論有無前車：紅燈轉綠燈皆須通知
----
-
-## ✨ 功能特色
-
-| 功能 | 說明 |
-|------|------|
-| 🚗 前車起步偵測 | YOLO 鎖定 + **OpenCV.js 稀疏光流 (LK)** + 背景抖動扣除 + FOE 徑向投票，只判方向不用閾值 |
-| 🟢 紅綠燈變換提醒 | 紅→綠自動提醒，含色彩分析 |
-| 🚙 自車運動偵測 | GPS 測速，行駛中靜默、靜止時才發通知 |
-| 📏 深度估測 | MiDaS 輔助判斷「最前方」車輛 |
-| 🔔 多重提醒 | 音效 + 震動 + 螢幕閃爍 |
-| 📱 PWA | 可安裝到手機桌面，支援離線使用 |
-| 📡 GPS 速度顯示 | 即時顯示當前車速 (km/h) |
+> v7 是一次針對「誤警太多、漏報也不少」的結構性重寫。
+> 判定量測從「逐點光流投票」換成**影像尺度變化率（1/TTC）**，
+> 統計觀測單位從 point 改成 tick，ego-motion 補償改由 **IMU 陀螺儀**主導，
+> 並新增**離線回放評測**管線，讓調參第一次有客觀依據。
 
 ---
 
-## 🏗️ 系統架構
+## v6 → v7：改了什麼、為什麼
 
-```mermaid
-graph LR
-    CAM[📷 鏡頭] --> YOLO[YOLOv8n<br/>物件偵測]
-    GPS[📡 GPS] --> EGO[自車運動<br/>GPS 測速]
-    YOLO --> CAR[🚗 前車狀態機<br/>IDLE → LOCK → TRACK → DEPART]
-    YOLO --> TL[🚦 紅綠燈<br/>色彩分析]
-    CAM --> MIDAS[MiDaS<br/>深度估測] --> CAR
-    EGO --> CAR
-    CAR --> ALERT[🔔 音效 / 震動 / 閃爍]
-    TL --> ALERT
+| # | v6 的問題 | 後果 | v7 的作法 |
+|---|---|---|---|
+| 1 | SPRT 把 bbox 內 ~40 個特徵點當成 40 筆**獨立**觀測 | 前車是剛體，點的位移高度相關，有效樣本數 n_eff ≈ 1。證據被膨脹約 30 倍，**單一幀就能觸發** | 觀測單位改成 **tick**：80 個點先擬合成「1 個尺度參數 + 標準誤」，一個 tick 一筆觀測 |
+| 2 | FOE 寫死在 `(0.5W, 0.45H)`，且 LLR 只打折（0.85）不歸零 | 自車靜止時 FOE 在數學上不存在。任何持續偏壓的穩態值是 `net/(1−0.85) = net×6.7` → **放著不動也會誤報** | 完全不用 FOE。改測**尺度變化率** `V = −d·log(尺度)/dt = 1/TTC`；證據隨時間指數衰減且有物理下限 |
+| 3 | 只取殘差的 `sign()`，不看量級 | 次像素雜訊區等於擲硬幣 | 用背景殘差自我校準出 σ，量測值改成標準化的 `z = −log(s_rel)/σ`，保住 SNR |
+| 4 | 光流跑在**整幀降採樣到 320×180** | 10m 外前車以 1m/s 起步的邊緣位移僅 ~1.2px，和 LK 雜訊底同量級（SNR < 1） | 對 bbox 做**原生解析度裁切**（錨定 ROI，最長邊 ≤384px），同情境位移 ~5px |
+| 5 | bbox 來自幾百毫秒前的幀，光流抓的是最新幀 | 前景點撒到背景上 → 假殘差 | YOLO 移進 **WebWorker**；主執行緒用 `requestVideoFrameCallback` 跑光流，ROI 用 **KF 預測到「現在」**的框 |
+| 6 | 前景點沿用 `nextPts`，只檢查 LK 的 `status` | 追丟的點滑到背景仍繼續投票 | **forward-backward 一致性檢核** + 強制剔除跑出目標框的點 |
+| 7 | 背景 RANSAC 假設「bbox 外都是靜止的」 | 路口旁車道車流佔多數時，RANSAC 鎖到移動車群 → **誤報起步** | IMU 陀螺儀交叉檢核：預測與觀測不符超過 4σ → 該 tick 標記不可信、不累積證據 |
+| 8 | 每 tick 串行跑 YOLOv8s@640 + MiDaS@256 + UFLD@800×288 | 實際 tick 率推估僅 1~2 fps，LK 的 small-motion 假設崩潰 | 砍掉 MiDaS、暫時移除 UFLD、YOLO 降到 **yolov8n@384 + WebGPU** 並移進 Worker |
+| 9 | MiDaS 取 bbox 內**所有像素平均**當深度，且輸出是逐幀變動的 relative inverse depth | 選錯前車 | 用**透視幾何**：bbox 底邊越低 = 越近。免費、跨幀穩定 |
+| 10 | `EMA_ALPHA=0.18` + `IOU_LOCK_MATCH=0.15` | 起步時 bbox 縮小，滯後的平滑框 IoU 掉破門檻 → 追蹤斷 → **證據被 `ofReleaseAll()` 清空**，恰好在最該報警的那一刻 | **Kalman + 三重門關聯**（IoU / 中心距 / 尺寸比）+ 遺失時**coast 而非歸零** |
+| 11 | 「中央 60%」的固定硬閘 | 不分遠近，一律用同一個畫面比例 | 走廊半寬由**地面平面幾何**推導：`半寬_px = (車道半寬/相機高度)·(y−y_horizon)`，焦距自然消掉 |
+| 12 | GPS `speed` 不可用時「維持上一狀態」 | 初值 `false` → GPS 一失效就**行駛中也照報**；反之會永久靜默 | **三路融合**（GPS / IMU 加速度變異數 / 視覺背景殘差）+ 明確的 `unknown` 第三狀態 |
+| 13 | `models/ufld_tusimple.onnx` **從未存在** | `useUfld` 一直是 false，車道線功能從來沒運作過 | 移除，改由 IMU 地平線 + 透視走廊取代（見 #11） |
+| 14 | 1906 行單檔、~40 個模組級全域變數、判定與 DOM 交纏 | 無法單元測試、無法離線回放 → 只能盲調 | 拆成 21 個模組；`src/core/pipeline.js` **不 import 任何 DOM**，同一份 pipeline 同時驅動即時 App 與離線評測 |
+| 15 | 完全沒有耗時量測，也沒有任何客觀指標 | 不知道實際 tick 率、不知道誤警率 | **除錯面板**（各階段 ms + 實際 Hz）+ **錄影/標註/回放評測**管線 |
+
+另有死碼清除：`nextYoloTime`/`nextDepthTime`/`nextUfldTime`、`MOVE_*` 五個常數、`bboxHistory`、`moveConfirmCount`、`ofFgAliveMask` 在 v6 都是宣告後從未使用。
+
+---
+
+## 核心原理：為什麼改測「尺度變化率」
+
+車輛沿光軸遠離時，影像等比例縮小。對影像寬 `w ∝ 1/Z` 取對數微分：
+
+```
+d/dt log(w) = −(1/Z)·dZ/dt = −V_rel/Z = −1/TTC
 ```
 
+所以定義 **`V ≡ −d·log(尺度)/dt`**，單位 1/秒，物理意義就是 **1/TTC**。`V > 0` ⇔ 正在遠離。
+
+這比逐點徑向投票好在三點：
+
+1. **天然免疫手機抖動** — 抖動主要產生平移與旋轉，幾乎不改變尺度
+2. **統計上正確** — 80 個高度相關的點濃縮成 1 個參數 + 明確的標準誤，SPRT 的獨立性假設才成立
+3. **不需要 FOE，也不需要深度模型**
+
+實作上對前景點與背景點**分別**擬合相似變換（平移+旋轉+尺度），取相對尺度 `s_rel = s_fg / s_bg` — 這還順便消掉了全域縮放（對焦呼吸、自車輕微前進）。
+
+尺度的標準誤由最小平方傳播得到，不是憑感覺的門檻：
+
+```
+σ_s ≈ σ_residual / (r_rms · √n)
+```
+
+### 觸發需要同時滿足
+
+| 條件 | 說明 |
+|---|---|
+| `z_kf = V/σ_V ≥ z_fire` | Kalman 濾波後的 V 顯著大於 0。`z_fire` 由 `α` 反推（α=1e-4 → 3.72σ） |
+| `LLR ≥ A` | tick 級 SPRT 累積（高斯 LLR `μz − μ²/2`），`A = ln((1−β)/α)` |
+| `V ≥ minInvTtc` | 物理下限，濾掉「統計上顯著但物理上等於沒動」 |
+| dwell ≥ 260ms 且 ≥ 4 ticks | 防模型誤差造成的瞬時尖峰 |
+| 影像往地平線方向移動 | 幾何佐證 |
+| 自車靜止 + 背景可信 | 前置條件 |
+
+**單 tick 的 z 被夾在 ±3**，所以單 tick 最多貢獻 LLR 4.0，而 `A = 9.16` — **結構上不可能單幀觸發**。
+
 ---
 
-## 🔄 前車追蹤狀態機
+## 系統架構
 
-| 狀態 | 說明 | 轉換條件 |
-|------|------|----------|
-| **IDLE** | 無前車 | 偵測到車輛 → LOCKING |
-| **LOCKING** | 候選車確認中 | 連續 3 幀 IoU 匹配 → TRACKING；失敗 → IDLE |
-| **TRACKING** | 追蹤中 | 靜止時光流多數決連續 3 tick 偵測到「朝 FOE 徑向位移」→ ⚡ 前車已起步；車輛消失 → DEPARTING；行駛中 → 靜默 |
-| **DEPARTING** | 確認離開中 | 車輛重現 → TRACKING；連續 5 幀消失 → ⚡ 前車已駛離 |
+```mermaid
+graph TB
+    subgraph MT["主執行緒（每個 video frame，~30Hz）"]
+        CAM[📷 requestVideoFrameCallback] --> FLOW[錨定 ROI 原生裁切<br/>LK + FB 檢核]
+        FLOW --> FIT[前景/背景分別擬合<br/>相似變換]
+        FIT --> DEP[起步判定<br/>KF on 1/TTC + tick級 SPRT]
+        TRK[Kalman 追蹤器<br/>三重門關聯 + coast] --> SEL[前車選取<br/>透視走廊 + 底邊最低]
+        SEL --> FLOW
+        IMU[📐 IMU 陀螺儀/重力] --> XCHK[交叉檢核<br/>RLS 線上學增益]
+        XCHK --> FIT
+        IMU --> HOR[地平線估計] --> SEL
+        LIGHT[🚦 紅綠燈<br/>色彩 + 燈位佐證] --> ALERT
+        DEP --> ALERT[🔔 音效/震動/閃爍]
+    end
+    subgraph WK["WebWorker"]
+        YOLO[YOLOv8n@384<br/>WebGPU → WASM]
+    end
+    CAM -.ImageBitmap.-> YOLO
+    YOLO -.帶時間戳的偵測結果.-> TRK
+    GPS[📡 GPS] --> EGO[自車狀態三路融合]
+    IMU --> EGO
+    FIT --> EGO
+    EGO --> DEP
+    EGO --> LIGHT
+```
 
-> 移動判定使用 **OpenCV.js 稀疏光流（Lucas-Kanade）+ 仿射 ego-motion 補償**：bbox 內撒 Shi-Tomasi 特徵點（前景），bbox 外撒一組點（背景）；用 `estimateAffinePartial2D` (RANSAC) 從背景點估出整張畫面的「平移+旋轉+尺度」變換 *T*，把前景點 prev 用 *T* warp 後的殘差才視為前車真實運動。每點殘差再對 FOE 取徑向方向，朝 FOE = 起步證據。判定採 **序列機率比檢定 (SPRT)** 累積證據：訊號強時 1 個 tick 就觸發，雜訊大時自動多看幾幀。**完全無像素/百分比閾值**，可調的只有可解釋的統計量 α/β（誤警率/漏報率）。
-
-### 通知邏輯
-
-| 自車狀態 | 事件 | 會通知？ |
-|----------|------|----------|
-| 🚗 移動 | 任何事件 | ❌ 全部靜默 |
-| 🛑 靜止 | 前車起步（光流：朝 FOE 徑向位移多數決） | ✅ 會通知 |
-| 🛑 靜止 | 紅→綠 | ✅ 會通知 |
-| 🛑 靜止 | 前車消失（連續 5 幀） | ✅ 會通知 |
+**關鍵設計：偵測與追蹤解耦。** YOLO 結果帶著自己的影像時間戳回來（延遲可能 200~400ms），由 Kalman 用該時間戳更新；需要「現在」的框時再 `boxAt(now)` 外推。於是推論慢不再拖垮光流的節拍。
 
 ---
 
-## 📂 專案結構
+## 專案結構
 
 ```
 A-Eye/
-├── index.html          # PWA 主頁面 + UI 樣式
-├── app.js              # 核心邏輯（~1200 行）
-├── yolo-classes.js     # COCO 80 類別名稱
-├── manifest.json       # PWA manifest
-├── sw.js               # Service Worker（離線快取）
-├── export_models.py    # 模型匯出/下載腳本
-└── models/
-    ├── yolov8s.onnx     # YOLOv8s 物件偵測（~22 MB；找不到時自動退回 yolov8n）
-    └── midas_small.onnx # MiDaS Small 深度估測（~17 MB）
+├── index.html                  # 主畫面
+├── replay.html                 # ★ 離線回放評測頁
+├── sw.js  manifest.json
+├── src/
+│   ├── main.js                 # 協調層（唯一碰 DOM 的地方 + ui/）
+│   ├── config.js               # ★ 全部參數集中於此
+│   ├── core/pipeline.js        # ★ 判定管線（不 import 任何 DOM）
+│   ├── util/math.js            # KF / RLS / 穩健統計 / normInv
+│   ├── sensors/                # gps.js  imu.js
+│   ├── perception/             # detector.js  detector.worker.js
+│   ├── tracking/               # kalmanBox.js  tracker.js
+│   ├── motion/                 # opticalFlow.js  departure.js  egoMotion.js
+│   ├── logic/                  # frontCar.js  trafficLight.js
+│   ├── ui/                     # overlay.js  alerts.js  hud.js
+│   ├── capture/                # frameSource.js  recorder.js
+│   └── tools/replay.js         # 回放評測核心
+├── tools/selftest/             # ★ 離線自我測試（node，無需瀏覽器）
+├── legacy/                     # v6 原始碼（app.v6.js / index.v6.html）
+└── models/yolov8n_384.onnx     # 執行 export_models.py 產生
 ```
+
+`config.js` 只允許兩種數字：**物理量**（公尺、秒、m/s、弧度）與**機率**（α、β）。像素、百分比、「連續幾幀」這類拍腦袋的數字一律避免；需要尺度時用資料自己估出的 σ 做正規化。
 
 ---
 
-## 🚀 快速開始
-
-### 1. 取得模型
+## 快速開始
 
 ```bash
-pip install ultralytics onnx onnxruntime
+# 1) 取得模型（產生 models/yolov8n_384.onnx）
+pip install ultralytics onnx onnxsim
 python export_models.py
-```
 
-### 2. 啟動伺服器
-
-```bash
-# 需要 HTTPS 才能使用 GPS + 相機
+# 2) 啟動（GPS + 相機 + IMU 都需要 HTTPS 或 localhost）
 npx serve .
+
+# 3) 離線自我測試（不需要瀏覽器）
+node tools/selftest/all.mjs
 ```
 
-### 3. 手機開啟
+手機開啟 `https://<你的IP>:3000`，允許**相機**、**定位**、**動作感測器**權限。
 
-1. 用手機瀏覽器開啟 `https://<你的IP>:3000`
-2. 允許**相機**與**定位**權限
-3. 點擊「開始偵測」，將手機固定在擋風玻璃前
+- `?debug=1` — 開啟除錯面板（各階段耗時、實際 Hz、證據累積、光流失敗原因分佈）+ Eruda console
+- `?reset=1` — 清除所有快取與 Service Worker
 
-> 💡 可點擊「加到主畫面」安裝為 PWA App
+### 建議加上 COOP/COEP 標頭
 
----
+ONNX Runtime 的多執行緒 WASM 需要 cross-origin isolation。加上這兩個標頭可以讓 WASM 後端快 2~3 倍（WebGPU 可用時影響較小）：
 
-## ⚙️ 關鍵參數
-
-| 參數 | 值 | 說明 |
-|------|----|------|
-| `DETECT_INTERVAL` | 100ms | 所有判定統一 tick |
-| `EMA_ALPHA` | 0.18 | Bbox 平滑係數（越低越穩） |
-| `OF_INPUT_W × H` | 320×180 | 光流降採樣解析度 |
-| `OF_MAX_FG_POINTS` | 60 | bbox 內前景特徵點上限 |
-| `OF_MAX_BG_POINTS` | 80 | 背景特徵點上限（仿射估計用） |
-| `OF_SPRT_P1` | 0.70 | 起步假設下「徑向票朝 FOE」機率 |
-| `OF_SPRT_ALPHA` | 0.01 | 可容忍誤警率 |
-| `OF_SPRT_BETA` | 0.05 | 可容忍漏報率 |
-| `OF_LLR_DECAY` | 0.85 | 證據折扣（避免長期偏置） |
-| `GPS_MOVE_SPEED` | 1.5 m/s | GPS 移動門檻 (~5.4 km/h) |
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
 
 ---
 
-## 📱 技術棧
+## 除錯面板讀法
 
-- **ONNX Runtime Web** 1.17.0 — 瀏覽器端 AI 推論（WebGL / WASM）
-- **YOLOv8s** — 即時物件偵測（640×640, 80 類，較 8n 召回率↑；找不到時自動退回 8n）
-- **MiDaS Small** — 單目深度估測（256×256）
-- **OpenCV.js** 4.9 — LK 稀疏光流 + `estimateAffinePartial2D` ego-motion 補償
-- **TensorFlow.js + COCO-SSD** — 降級備援方案
-- **GPS** (`navigator.geolocation`) — 自車速度偵測
-- **PWA** (Service Worker + Wake Lock + PiP)
+```
+frame 29.8Hz | tick 29.1Hz | flow 24.6Hz | det 7.4Hz     ← 實際節拍（v6 推估只有 1~2Hz）
+tick 8.2ms (flow 6.1 draw 1.4)
+yolo pre 3.1 infer 41.2 dec 1.8 → 延遲 58ms              ← 偵測延遲，KF 會補償掉
+model yolov8n_384.onnx @webgpu 384px
+──────────────────────────────────
+ego=still(gps) 0.0km/h visσ=0.31
+horizon=0.47 laneCx=0.502
+V=0.118±0.013 z=9.08/3.72 LLR=11.4/9.16 TTC=8.5s n=12 FIRE
+flow fg=54/71 bg=63/78(81%) sRel=0.99412±1.2e-3 dy=-2.31
+imu cal=Y q=0.83 disagree=1.2σ trusted=Y
+light=red(state=red) b=142 r=61@0.21 g=3@0.70 y=2
+```
+
+畫面上還會直接畫出兩條證據進度條（`z` 與 `LLR`）、走廊、地平線、ROI 範圍 — 在手機上實測時看得見證據怎麼累積，才有可能除錯。
 
 ---
 
-## TODO
--[ ]前車起步事件能否精準判定 : 可能前車未動被判定有動、可能偵測步道前車、可能偵測到其他車道的車或機車
--[ ] 紅綠燈偵測是否精準: 可能偵測不到或者多個紅綠燈號誌偵測錯。
+## 離線回放評測（強烈建議先做這件事）
+
+沒有客觀指標的話，任何調參都只能憑「今天路上感覺比較少誤報」判斷，不可能收斂。
+
+1. 主畫面按 **⏺** 開始錄影
+2. 前車一起步就按 **🚩**（這就是 ground truth 時間點）
+3. 停止後會下載三個檔案：`.webm` / `.sensors.jsonl` / `.meta.json`
+4. 開 `replay.html`，把三個檔案丟進去 → 輸出
+
+| 指標 | 意義 |
+|---|---|
+| **誤警 / 小時** | 最重要的指標。目標 < 1 |
+| **命中率 (recall)** | 標註點在 −0.5s ~ +3s 內有警示才算命中 |
+| **延遲中位數 / P90** | 從 ground truth 到警示的時間 |
+| 光流失敗原因分佈 | `bg-inconsistent` 多 → 路口車流干擾；`fg-too-few` 多 → 目標紋理不足 |
+
+回放使用**完全同一份 pipeline**，所以量到的就是真機行為。建議也錄一段「前車全程不動」的**靜止對照組**（不打任何標註），那段的所有警示都是誤警。
 
 ---
 
-## 📄 License
+## 離線自我測試結果
 
-MIT License — 詳見 [LICENSE](LICENSE)
+`node tools/selftest/all.mjs`（不需瀏覽器，用合成訊號驗證判定器的統計行為）：
+
+```
+=== 誤警（前車完全靜止，σ_log(s)=7.1e-4、20Hz）===
+  系統性偏壓 0.00σ/tick → 0 次誤警 / 小時
+  系統性偏壓 0.50σ/tick → 0 次誤警 / 小時
+  系統性偏壓 1.00σ/tick → 0 次誤警 / 小時
+
+=== 真實起步（等加速度 2 m/s²）===
+  5m 前方  → 450 ms（此時車速 0.90 m/s）
+  10m 前方 → 550 ms（此時車速 1.10 m/s）
+  20m 前方 → 950 ms（此時車速 1.90 m/s）
+
+=== 反向情境（應永不觸發）===
+  前車正在靠近 / 影像往下移 / 自車行駛中 → 全部 0 次
+
+=== 模型誤差突波 ===
+  1 個 100σ 的離群 tick → 0 次誤警（z 夾限發揮作用）
+  10 個連續 5σ 的一致離群 tick → 1 次誤警
+
+=== 追蹤中斷的韌性（v6 在此漏報）===
+  V=0.20/s 且中途斷追 400ms → 950 ms 仍能報出
+```
+
+> 最後一項的誠實說明：**連續 500ms 的一致 5σ 尺度縮小，在物理上就等於真的在遠離**（V ≈ 0.07/s）。任何演算法都無法區分。這就是為什麼「背景不一致偵測」與「IMU 交叉檢核」很重要 — 它們負責在源頭攔掉這種相關誤差。
+
+---
+
+## 通知邏輯
+
+| 自車狀態 | 事件 | 會通知？ |
+|---|---|---|
+| 🚗 移動 | 任何事件 | ❌ 全部靜默 |
+| 🛑 靜止 | 前車起步（尺度變化率判定） | ✅ |
+| 🛑 靜止 | 紅→綠（需持續 400ms） | ✅ |
+| ❓ 未知 | 任何事件 | ❌（可用 `config.ego.unknownIsStill` 改變） |
+
+---
+
+## 已知限制與下一步
+
+- **「前車已駛離」通知已移除。** v6 用「連續 5 幀消失」判定，在低幀率下等同 2~5 秒，遮擋或漏檢就誤報。v7 的 KF coast 讓「消失」變得罕見，若要重新加入應改用「track 確實被淘汰 + 該位置無任何車輛」的雙條件。
+- **車道線偵測暫時移除。** 模型檔從未存在，且 TuSimple 的訓練視角與手機安裝角度差異大。目前由 IMU 地平線 + 透視走廊取代。若日後要加回，`FrontCarSelector.select()` 已預留 `laneWeightFn` 參數（軟性加權，不做硬閘）。
+- **`frontCar.cameraHeightM` 需依實際安裝高度調整**（預設 1.2m）。這個值直接決定走廊寬度，是目前最值得手動校準的參數。
+- **IMU 交叉檢核需要暖機。** 陀螺儀增益用 RLS 線上學習，約需 60 個有效樣本（幾秒的正常晃動）才開始生效；在那之前退回純視覺補償。
+
+---
+
+## 授權
+
+MIT — 見 [LICENSE](LICENSE)
