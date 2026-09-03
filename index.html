@@ -10,16 +10,12 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
-<script src="yolo-classes.js"></script>
-<!-- 開發工具：?debug=1 啟用 Eruda 手機版 console；?reset=1 清除所有快取 / SW -->
+<!-- 開發工具：?debug=1 啟用除錯面板 + Eruda 手機版 console；?reset=1 清除快取 / SW -->
 <script>
   (function () {
     var params;
-    try { params = new URLSearchParams(location.search); } catch (_) { params = null; }
-    if (!params) return;
+    try { params = new URLSearchParams(location.search); } catch (_) { return; }
 
-    // === 一鍵清除：?reset=1 ===
     if (params.get('reset') === '1') {
       document.documentElement.innerHTML =
         '<body style="background:#0a0a0a;color:#fff;font-family:sans-serif;padding:24px;line-height:1.6">' +
@@ -27,64 +23,38 @@
         '<pre id="log" style="font-size:12px;opacity:0.8;white-space:pre-wrap"></pre></body>';
       var logEl = document.getElementById('log');
       var log = function (m) { if (logEl) logEl.textContent += m + '\n'; };
-
       var tasks = [];
-
-      // 1) 註銷所有 Service Worker（先檢查存在）
       if ('serviceWorker' in navigator && navigator.serviceWorker &&
           typeof navigator.serviceWorker.getRegistrations === 'function') {
-        tasks.push(
-          navigator.serviceWorker.getRegistrations()
-            .then(function (rs) {
-              log('找到 ' + rs.length + ' 個 Service Worker');
-              return Promise.all(rs.map(function (r) {
-                return r.unregister().then(function (ok) {
-                  log('  unregister: ' + (r.scope || '?') + ' = ' + ok);
-                });
-              }));
-            }).catch(function (e) { log('SW 清除錯誤: ' + e.message); })
-        );
-      } else {
-        log('navigator.serviceWorker 不可用（略過）');
-      }
-
-      // 2) 清除所有 Cache Storage
-      if (typeof caches !== 'undefined' && caches.keys) {
-        tasks.push(
-          caches.keys().then(function (ks) {
-            log('找到 ' + ks.length + ' 個 cache');
-            return Promise.all(ks.map(function (k) {
-              return caches.delete(k).then(function (ok) {
-                log('  delete cache: ' + k + ' = ' + ok);
-              });
+        tasks.push(navigator.serviceWorker.getRegistrations()
+          .then(function (rs) {
+            log('找到 ' + rs.length + ' 個 Service Worker');
+            return Promise.all(rs.map(function (r) {
+              return r.unregister().then(function (ok) { log('  unregister: ' + (r.scope || '?') + ' = ' + ok); });
             }));
-          }).catch(function (e) { log('cache 清除錯誤: ' + e.message); })
-        );
+          }).catch(function (e) { log('SW 清除錯誤: ' + e.message); }));
       }
-
-      // 3) 清除 storage
+      if (typeof caches !== 'undefined' && caches.keys) {
+        tasks.push(caches.keys().then(function (ks) {
+          log('找到 ' + ks.length + ' 個 cache');
+          return Promise.all(ks.map(function (k) {
+            return caches.delete(k).then(function (ok) { log('  delete: ' + k + ' = ' + ok); });
+          }));
+        }).catch(function (e) { log('cache 清除錯誤: ' + e.message); }));
+      }
       try { localStorage.clear(); log('localStorage 已清除'); } catch (_) {}
       try { sessionStorage.clear(); log('sessionStorage 已清除'); } catch (_) {}
-
       Promise.all(tasks).then(function () {
         log('\n✅ 完成！3 秒後重新載入...');
-        setTimeout(function () {
-          location.replace(location.pathname);
-        }, 3000);
+        setTimeout(function () { location.replace(location.pathname); }, 3000);
       });
-      return; // 不要繼續載入 app
+      return;
     }
 
-    // === Eruda Mobile DevTools：?debug=1 ===
     if (params.get('debug') === '1' || (location.hash || '').indexOf('debug') >= 0) {
       var s = document.createElement('script');
       s.src = 'https://cdn.jsdelivr.net/npm/eruda';
-      s.onload = function () {
-        if (window.eruda) {
-          eruda.init();
-          console.log('[A-Eye] Eruda DevTools 已啟用 (debug mode)');
-        }
-      };
+      s.onload = function () { if (window.eruda) { eruda.init(); console.log('[A-Eye] Eruda 已啟用'); } };
       document.head.appendChild(s);
     }
   })();
@@ -97,162 +67,98 @@ body {
   height: 100dvh; overflow: hidden;
   display: flex; flex-direction: column;
 }
+#camera { flex: 1; width: 100%; object-fit: cover; background: #111; }
 
-/* 相機畫面 */
-#camera {
-  flex: 1; width: 100%; object-fit: cover;
-  background: #111;
-}
-
-/* 狀態列 */
 #status-bar {
   position: absolute; top: 0; left: 0; right: 0;
-  padding: 12px 16px;
-  padding-top: max(12px, env(safe-area-inset-top));
+  padding: 12px 16px; padding-top: max(12px, env(safe-area-inset-top));
   display: flex; align-items: center; gap: 10px;
   background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
   z-index: 10;
 }
 #status-dot {
   width: 10px; height: 10px; border-radius: 50%;
-  background: #4ade80; flex-shrink: 0;
-  animation: pulse 2s infinite;
+  background: #4ade80; flex-shrink: 0; animation: pulse 2s infinite;
 }
 #status-dot.inactive { background: #666; animation: none; }
-#status-text { font-size: 14px; opacity: 0.9; }
+#status-text { font-size: 13px; opacity: 0.9; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-
-/* 偵測結果區域 */
 #detection-panel {
   position: absolute; bottom: 0; left: 0; right: 0;
-  padding: 16px;
-  padding-bottom: max(16px, env(safe-area-inset-bottom));
+  padding: 16px; padding-bottom: max(16px, env(safe-area-inset-bottom));
   background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
   z-index: 10;
 }
-
-#alerts {
-  display: flex; flex-direction: column; gap: 8px;
-  margin-bottom: 12px;
-}
-
+#alerts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
 .alert-badge {
-  padding: 10px 16px;
-  border-radius: 12px;
+  padding: 10px 16px; border-radius: 12px;
   font-size: 15px; font-weight: 600;
   display: flex; align-items: center; gap: 8px;
   animation: slideUp 0.3s ease-out;
 }
-.alert-badge.move {
-  background: rgba(59, 130, 246, 0.25);
-  border: 1px solid rgba(59, 130, 246, 0.5);
-  color: #93c5fd;
-}
-.alert-badge.green {
-  background: rgba(34, 197, 94, 0.25);
-  border: 1px solid rgba(34, 197, 94, 0.5);
-  color: #86efac;
-}
-.alert-badge.red {
-  background: rgba(239, 68, 68, 0.15);
-  border: 1px solid rgba(239, 68, 68, 0.3);
-  color: #fca5a5;
-}
-.alert-badge.idle {
-  background: rgba(255,255,255,0.08);
-  border: 1px solid rgba(255,255,255,0.15);
-  color: rgba(255,255,255,0.5);
-}
+.alert-badge.move { background: rgba(59,130,246,0.25); border: 1px solid rgba(59,130,246,0.5); color: #93c5fd; }
+.alert-badge.green { background: rgba(34,197,94,0.25); border: 1px solid rgba(34,197,94,0.5); color: #86efac; }
+.alert-badge.red { background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: #fca5a5; }
+.alert-badge.idle { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.55); font-size: 14px; }
+@keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-@keyframes slideUp {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-/* 控制按鈕 */
-#controls {
-  display: flex; gap: 10px;
-}
+#controls { display: flex; gap: 10px; }
 #toggle-btn {
-  flex: 1; padding: 14px;
-  border: none; border-radius: 14px;
-  font-size: 16px; font-weight: 600;
-  cursor: pointer; transition: all 0.2s;
+  flex: 1; padding: 14px; border: none; border-radius: 14px;
+  font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.2s;
 }
-#toggle-btn.start {
-  background: #4ade80; color: #052e16;
-}
-#toggle-btn.stop {
-  background: rgba(239, 68, 68, 0.8); color: #fff;
-}
-.btn-icon {
-  width: 22px; height: 22px; vertical-align: middle;
-  margin-right: 4px; border-radius: 4px;
-}
-#pip-btn {
-  width: 52px; padding: 14px;
-  border: 1px solid rgba(255,255,255,0.2);
-  border-radius: 14px; background: rgba(255,255,255,0.08);
-  color: #fff; font-size: 18px; cursor: pointer;
+#toggle-btn.start { background: #4ade80; color: #052e16; }
+#toggle-btn.stop { background: rgba(239,68,68,0.8); color: #fff; }
+.btn-icon { width: 22px; height: 22px; vertical-align: middle; margin-right: 4px; border-radius: 4px; }
+.icon-btn {
+  min-width: 48px; padding: 14px 10px;
+  border: 1px solid rgba(255,255,255,0.2); border-radius: 14px;
+  background: rgba(255,255,255,0.08); color: #fff; font-size: 17px; cursor: pointer;
 }
 
-/* 偵測項目開關 */
-#feature-toggles {
-  display: flex; gap: 8px; margin-bottom: 10px;
-  flex-wrap: wrap;
-}
+#feature-toggles { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
 .feature-toggle {
   flex: 1; min-width: 140px;
   display: flex; align-items: center; gap: 8px;
   padding: 10px 12px;
   background: rgba(255,255,255,0.06);
   border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 10px;
-  font-size: 13px; font-weight: 500;
-  cursor: pointer; user-select: none;
-  transition: all 0.2s;
+  border-radius: 10px; font-size: 13px; font-weight: 500;
+  cursor: pointer; user-select: none; transition: all 0.2s;
 }
-.feature-toggle input[type="checkbox"] {
-  width: 18px; height: 18px; accent-color: #4ade80;
-  cursor: pointer;
-}
-.feature-toggle.active {
-  background: rgba(74, 222, 128, 0.15);
-  border-color: rgba(74, 222, 128, 0.5);
-  color: #bbf7d0;
+.feature-toggle input[type="checkbox"] { width: 18px; height: 18px; accent-color: #4ade80; cursor: pointer; }
+.feature-toggle.active { background: rgba(74,222,128,0.15); border-color: rgba(74,222,128,0.5); color: #bbf7d0; }
+
+#overlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 5; }
+
+#debug-panel {
+  position: absolute; top: 44px; left: 8px; right: 8px;
+  max-height: 42dvh; overflow: auto;
+  padding: 8px 10px; z-index: 20; display: none;
+  background: rgba(0,0,0,0.72); border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px; line-height: 1.45; white-space: pre-wrap;
+  color: #a7f3d0; pointer-events: none;
 }
 
-/* 偵測框 overlay */
-#overlay {
-  position: absolute; top: 0; left: 0;
-  width: 100%; height: 100%;
-  pointer-events: none; z-index: 5;
-}
-
-/* 全螢幕閃爍提醒 */
-#flash-overlay {
-  position: fixed; inset: 0;
-  pointer-events: none; z-index: 100;
-  opacity: 0; transition: opacity 0.15s;
-}
+#flash-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 100; opacity: 0; transition: opacity 0.15s; }
 #flash-overlay.active { opacity: 1; }
-#flash-overlay.move-flash { background: rgba(59, 130, 246, 0.2); }
-#flash-overlay.green-flash { background: rgba(34, 197, 94, 0.25); }
+#flash-overlay.move-flash { background: rgba(59,130,246,0.2); }
+#flash-overlay.green-flash { background: rgba(34,197,94,0.25); }
 </style>
 </head>
 <body>
 
 <video id="camera" autoplay playsinline muted></video>
 <canvas id="overlay"></canvas>
+<pre id="debug-panel"></pre>
 
 <div id="status-bar">
   <div id="status-dot" class="inactive"></div>
   <span id="status-text">點擊下方按鈕開始偵測</span>
-  <span id="speed-display" style="margin-left:auto; font-size:14px; font-weight:600; opacity:0.85; display:none;">-- km/h</span>
+  <span id="speed-display" style="margin-left:auto;font-size:13px;font-weight:600;opacity:0.85;display:none">-- km/h</span>
 </div>
 
 <div id="detection-panel">
@@ -261,22 +167,25 @@ body {
   </div>
   <div id="feature-toggles">
     <label class="feature-toggle" id="toggle-car-label">
-      <input type="checkbox" id="enable-car" checked onchange="onFeatureToggle()">
+      <input type="checkbox" id="enable-car" checked>
       <span>🚗 前車起步偵測</span>
     </label>
     <label class="feature-toggle" id="toggle-light-label">
-      <input type="checkbox" id="enable-light" checked onchange="onFeatureToggle()">
+      <input type="checkbox" id="enable-light" checked>
       <span>🚦 紅綠燈偵測</span>
     </label>
   </div>
-  <div id="controls">    <button id="toggle-btn" class="start" onclick="toggleDetection()"><img src="icon-192.png" class="btn-icon"> 開始偵測</button>
-    <button id="pip-btn" onclick="togglePiP()" title="子母畫面" style="display:none">🖼</button>
-    <button id="debug-btn" onclick="debugMode=!debugMode;this.style.opacity=debugMode?1:0.4" title="Debug" style="opacity:0.4;background:#333;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;font-size:13px;cursor:pointer">🔍</button>
+  <div id="controls">
+    <button id="toggle-btn" class="start"><img src="icon-192.png" class="btn-icon"> 開始偵測</button>
+    <button id="mark-btn" class="icon-btn" title="標註：前車起步了（錄影時用）" style="display:none">🚩</button>
+    <button id="rec-btn" class="icon-btn" title="錄影 + 感測器記錄" style="display:none">⏺</button>
+    <button id="pip-btn" class="icon-btn" title="子母畫面" style="display:none">🖼</button>
+    <button id="debug-btn" class="icon-btn" title="除錯面板" style="opacity:0.4">🔍</button>
   </div>
 </div>
 
 <div id="flash-overlay"></div>
 
-<script src="app.js"></script>
+<script type="module" src="src/main.js"></script>
 </body>
 </html>

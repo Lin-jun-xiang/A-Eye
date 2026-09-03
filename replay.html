@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A-Eye 離線回放評測</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 20px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #0d1117; color: #e6edf3; line-height: 1.55;
+}
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { font-size: 13px; color: #8b949e; margin-bottom: 20px; }
+.card {
+  background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+  padding: 16px; margin-bottom: 16px;
+}
+label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 4px; }
+input[type=file], input[type=number], select {
+  width: 100%; padding: 8px; margin-bottom: 12px;
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3;
+}
+button {
+  padding: 10px 18px; border: none; border-radius: 8px;
+  background: #238636; color: #fff; font-weight: 600; cursor: pointer; font-size: 14px;
+}
+button:disabled { opacity: 0.45; cursor: default; }
+button.secondary { background: #30363d; }
+#bar { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; margin: 12px 0; }
+#bar > div { height: 100%; width: 0; background: #238636; transition: width 0.2s; }
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; white-space: pre-wrap; color: #7ee787;
+  max-height: 300px; overflow: auto; margin: 0;
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td, th { padding: 6px 8px; border-bottom: 1px solid #21262d; text-align: left; }
+th { color: #8b949e; font-weight: 500; font-size: 12px; }
+.big { font-size: 22px; font-weight: 700; }
+.good { color: #7ee787; } .bad { color: #ff7b72; } .warn { color: #d29922; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.metric { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; }
+.metric .k { font-size: 11px; color: #8b949e; }
+video, canvas { max-width: 100%; border-radius: 6px; background: #000; }
+.row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.row > div { flex: 1; min-width: 120px; }
+code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>A-Eye 離線回放評測</h1>
+<div class="sub">
+  用錄好的影片 + 感測器記錄驅動<strong>完全同一份 pipeline</strong>，量出誤警率 / 漏報率 / 偵測延遲。<br>
+  資料來源：在 App 主畫面按 <code>⏺</code> 開始錄影，前車起步時按 <code>🚩</code> 打 ground truth，停止後會下載三個檔案。
+</div>
+
+<div class="card">
+  <div class="row">
+    <div>
+      <label>影片檔（必填，*.webm / *.mp4）</label>
+      <input type="file" id="f-video" accept="video/*">
+    </div>
+    <div>
+      <label>感測器記錄（選填，*.sensors.jsonl）</label>
+      <input type="file" id="f-sensor" accept=".jsonl,.ndjson,application/x-ndjson">
+    </div>
+    <div>
+      <label>標註檔（選填，*.meta.json）</label>
+      <input type="file" id="f-meta" accept=".json,application/json">
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>回放取樣率 (Hz)</label>
+      <input type="number" id="hz" value="15" min="2" max="30">
+    </div>
+    <div style="flex:0 0 auto">
+      <button id="run" disabled>開始評測</button>
+      <button id="stop" class="secondary" disabled>中止</button>
+    </div>
+  </div>
+  <div id="bar"><div></div></div>
+  <div id="info" class="sub" style="margin:0"></div>
+</div>
+
+<div class="card" id="result-card" style="display:none">
+  <div class="grid" id="metrics"></div>
+  <div style="margin-top:14px">
+    <table id="events"></table>
+  </div>
+</div>
+
+<div class="card">
+  <label>即時狀態</label>
+  <pre id="log">等待載入檔案…</pre>
+</div>
+
+<div class="card">
+  <label>回放畫面</label>
+  <video id="video" muted playsinline style="display:none"></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<script type="module">
+import { ReplayRunner } from './src/tools/replay.js';
+
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+const lines = [];
+function log(m) {
+  lines.push(m);
+  if (lines.length > 40) lines.shift();
+  logEl.textContent = lines.join('\n');
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+const runner = new ReplayRunner({
+  video: $('video'),
+  canvas: $('canvas'),
+  onLog: log,
+  onProgress: (p, s) => {
+    $('bar').firstElementChild.style.width = (p * 100).toFixed(1) + '%';
+    if (s) {
+      $('info').textContent =
+        `t=${s.t.toFixed(1)}s · ${s.steps} 步 · ${s.events} 事件 · 已耗 ${(s.wallMs / 1000).toFixed(0)}s`;
+      if (s.debug) logEl.textContent = lines.join('\n') + '\n─────\n' + s.debug.join('\n');
+    }
+  },
+});
+
+let loaded = false;
+async function tryLoad() {
+  const vf = $('f-video').files[0];
+  if (!vf) return;
+  try {
+    const info = await runner.load({
+      videoFile: vf,
+      sensorFile: $('f-sensor').files[0] || null,
+      metaFile: $('f-meta').files[0] || null,
+    });
+    log(`✅ 影片 ${info.vw}x${info.vh}, ${info.duration.toFixed(1)}s`);
+    log(`   感測器 ${info.sensorRows} 筆、ground truth 標註 ${info.marks} 筆`);
+    if (info.marks === 0) log('   ⚠ 無標註 → 所有警示都會被算成誤警（適合用來測「靜止對照組」）');
+    loaded = true;
+    $('run').disabled = false;
+  } catch (e) {
+    log('❌ ' + e.message);
+  }
+}
+['f-video', 'f-sensor', 'f-meta'].forEach((id) => $(id).addEventListener('change', tryLoad));
+
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
+  $('stop').disabled = false;
+  try {
+    const rep = await runner.run({ hz: +$('hz').value });
+    if (rep) render(rep);
+  } catch (e) {
+    log('❌ ' + e.message + '\n' + e.stack);
+  }
+  $('run').disabled = false;
+  $('stop').disabled = true;
+});
+
+$('stop').addEventListener('click', () => { runner.abort = true; log('已請求中止…'); });
+
+function render(r) {
+  $('result-card').style.display = '';
+  const fpClass = r.fpPerHour === 0 ? 'good' : r.fpPerHour < 2 ? 'warn' : 'bad';
+  const recallClass = r.recall === null ? '' : r.recall >= 0.9 ? 'good' : r.recall >= 0.7 ? 'warn' : 'bad';
+  const m = [
+    ['誤警 / 小時', r.fpPerHour.toFixed(2), fpClass],
+    ['命中率 (recall)', r.recall === null ? '—' : (r.recall * 100).toFixed(0) + '%', recallClass],
+    ['延遲中位數', r.latencyMedianMs === null ? '—' : r.latencyMedianMs.toFixed(0) + ' ms', ''],
+    ['延遲 P90', r.latencyP90Ms === null ? '—' : r.latencyP90Ms.toFixed(0) + ' ms', ''],
+    ['TP / FP / FN', `${r.tp} / ${r.fp} / ${r.fn}`, ''],
+    ['綠燈事件', String(r.greenEvents), ''],
+    ['影片長度', r.durationSec.toFixed(1) + ' s', ''],
+    ['光流成功 tick', `${r.flowStats.flowOk}`, ''],
+  ];
+  $('metrics').innerHTML = m.map(([k, v, c]) =>
+    `<div class="metric"><div class="k">${k}</div><div class="big ${c}">${v}</div></div>`
+  ).join('');
+
+  const rows = r.events.map((e) =>
+    `<tr><td>${(e.t / 1000).toFixed(2)}s</td><td>${e.kind}</td><td>${e.text}</td></tr>`
+  ).join('');
+  $('events').innerHTML =
+    '<tr><th>時間</th><th>類型</th><th>內容</th></tr>' +
+    (rows || '<tr><td colspan="3">（無事件）</td></tr>');
+
+  const fails = Object.entries(r.flowStats.flowFail || {}).sort((a, b) => b[1] - a[1]);
+  log('');
+  log('=== 光流失敗原因分佈 ===');
+  for (const [k, v] of fails) log(`  ${k}: ${v}`);
+}
+</script>
+</body>
+</html>
