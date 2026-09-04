@@ -89,7 +89,7 @@ graph TB
         DEP --> ALERT[🔔 音效/震動/閃爍]
     end
     subgraph WK["WebWorker"]
-        YOLO[YOLOv8n@384<br/>WebGPU → WASM]
+        YOLO[YOLOv8n WebGPU → WASM]
     end
     CAM -.ImageBitmap.-> YOLO
     YOLO -.帶時間戳的偵測結果.-> TRK
@@ -125,6 +125,8 @@ A-Eye/
 │   ├── capture/                # frameSource.js  recorder.js
 │   └── tools/replay.js         # 回放評測核心
 ├── tools/selftest/             # ★ 離線自我測試（node，無需瀏覽器）
+├── tools/make_icons.py         # 品牌記號的唯一幾何來源 → icon.svg + 兩個 PNG
+├── docs/ui-states.md           # ★ 畫面狀態全集（16 種情境與設計意圖）
 ├── legacy/                     # v6 原始碼（app.v6.js / index.v6.html）
 └── models/yolov8n_384.onnx     # 執行 export_models.py 產生
 ```
@@ -180,6 +182,8 @@ light=red(state=red) b=142 r=61@0.21 g=3@0.70 y=2
 ```
 
 畫面上還會直接畫出兩條證據進度條（`z` 與 `LLR`）、走廊、地平線、ROI 範圍 — 在手機上實測時看得見證據怎麼累積，才有可能除錯。
+
+兩條進度條分別代表什麼、為什麼要兩條（而非一條），以及其餘 15 種畫面情境的完整對照，見 **[docs/ui-states.md](docs/ui-states.md)**。
 
 ---
 
@@ -241,6 +245,8 @@ light=red(state=red) b=142 r=61@0.21 g=3@0.70 y=2
 | 🛑 靜止 | 前車起步（尺度變化率判定） | ✅ |
 | 🛑 靜止 | 紅→綠（需持續 400ms） | ✅ |
 | ❓ 未知 | 任何事件 | ❌（可用 `config.ego.unknownIsStill` 改變） |
+
+這三種事件在畫面上長什麼樣（含音效、震動節奏、閃爍顏色與徽章樣式），見 [docs/ui-states.md § 警示](docs/ui-states.md#四警示3-種)。
 
 ---
 
