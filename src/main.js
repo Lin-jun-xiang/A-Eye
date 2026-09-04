@@ -51,7 +51,7 @@ let lastEventText = '';
 let lastEventTs = 0;
 const eventLog = [];
 
-const BTN_ICON = '<img src="icon-192.png" class="btn-icon">';
+const BTN_ICON = '<svg class="btn-icon"><use href="#logo"/></svg>';
 
 // ---------- 小工具 ----------
 function loadScript(src) {

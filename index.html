@@ -8,7 +8,8 @@
 <meta name="theme-color" content="#0a0a0a">
 <title>A-Eye 起步警示</title>
 <link rel="manifest" href="manifest.json">
-<link rel="icon" href="icon-192.png">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="icon-192.png" sizes="192x192">
 <link rel="apple-touch-icon" href="icon-192.png">
 <!-- 開發工具：?debug=1 啟用除錯面板 + Eruda 手機版 console；?reset=1 清除快取 / SW -->
 <script>
@@ -110,7 +111,7 @@ body {
 }
 #toggle-btn.start { background: #4ade80; color: #052e16; }
 #toggle-btn.stop { background: rgba(239,68,68,0.8); color: #fff; }
-.btn-icon { width: 22px; height: 22px; vertical-align: middle; margin-right: 4px; border-radius: 4px; }
+.btn-icon { width: 22px; height: 22px; vertical-align: middle; margin-right: 2px; color: currentColor; }
 .icon-btn {
   min-width: 48px; padding: 14px 10px;
   border: 1px solid rgba(255,255,255,0.2); border-radius: 14px;
@@ -151,6 +152,20 @@ body {
 </head>
 <body>
 
+<!-- 品牌記號 Lock Bracket。幾何與 tools/make_icons.py 的 SVG_MARK 同源；
+     只吃 currentColor，所以綠底按鈕自動變深綠、狀態列自動變白。 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="logo" viewBox="0 0 48 48">
+    <g fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M17 7H11a4 4 0 0 0-4 4v6"/>
+      <path d="M31 7h6a4 4 0 0 1 4 4v6"/>
+      <path d="M41 31v6a4 4 0 0 1-4 4h-6"/>
+      <path d="M7 31v6a4 4 0 0 0 4 4h6"/>
+    </g>
+    <circle cx="24" cy="24" r="7" fill="currentColor"/>
+  </symbol>
+</defs></svg>
+
 <video id="camera" autoplay playsinline muted></video>
 <canvas id="overlay"></canvas>
 <pre id="debug-panel"></pre>
@@ -176,7 +191,7 @@ body {
     </label>
   </div>
   <div id="controls">
-    <button id="toggle-btn" class="start"><img src="icon-192.png" class="btn-icon"> 開始偵測</button>
+    <button id="toggle-btn" class="start"><svg class="btn-icon"><use href="#logo"/></svg> 開始偵測</button>
     <button id="mark-btn" class="icon-btn" title="標註：前車起步了（錄影時用）" style="display:none">🚩</button>
     <button id="rec-btn" class="icon-btn" title="錄影 + 感測器記錄" style="display:none">⏺</button>
     <button id="pip-btn" class="icon-btn" title="子母畫面" style="display:none">🖼</button>
