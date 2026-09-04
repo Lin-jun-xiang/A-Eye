@@ -9,7 +9,18 @@
 //   把推論搬到 Worker 後，主執行緒可以用 video 的原生幀率跑光流與追蹤，
 //   偵測結果帶著自己的時間戳非同步回來，由 KF 做時間對齊。
 
-let ort = null;
+// 整個檔案包在 IIFE 裡，這不是風格偏好而是必要的：
+// importScripts() 載入的腳本是在 worker 的「全域範疇」執行的，所以本檔案
+// 任何頂層 let/const/function 都會與函式庫的全域宣告搶同一個命名空間。
+// 我們原本在頂層宣告了 `let ort`，而 onnxruntime-web 的 UMD bundle 也在頂層
+// 宣告 ort，於是 WebKit 直接丟出
+//     SyntaxError: Can't create duplicate variable: 'ort'
+// 腳本連執行的機會都沒有。包進 IIFE 後我們的宣告全都是函式範疇，
+// 之後換任何函式庫都不會再撞名。
+(function () {
+'use strict';
+
+let ortApi = null;
 let session = null;
 let inputName = null;
 let outputName = null;
@@ -41,12 +52,12 @@ let ctx = null;
  * 不受 importScripts 的限制。blob URL 沒有可用的相對基底，不能拿來當 base。
  */
 function configureOrt(baseUrl) {
-  ort = self.ort;
+  ortApi = self.ort;
   try {
-    ort.env.wasm.wasmPaths = baseUrl;
-    ort.env.wasm.numThreads = Math.min(4, self.navigator?.hardwareConcurrency || 2);
-    ort.env.wasm.simd = true;
-    ort.env.logLevel = 'error';
+    ortApi.env.wasm.wasmPaths = baseUrl;
+    ortApi.env.wasm.numThreads = Math.min(4, self.navigator?.hardwareConcurrency || 2);
+    ortApi.env.wasm.simd = true;
+    ortApi.env.logLevel = 'error';
   } catch (_) { /* 舊版可能沒有某些欄位 */ }
 }
 
@@ -66,7 +77,10 @@ function loadOrt(msg) {
   const errors = [];
   for (const a of attempts) {
     try {
-      importScripts(a.url);
+      // 上一次嘗試可能已經把 ort 定義進全域了（即使它之後才拋錯）。
+      // 若不先檢查就再 importScripts 一次，會撞上 duplicate variable 而
+      // 掩蓋掉真正的錯誤。
+      if (typeof self.ort === 'undefined') importScripts(a.url);
       if (typeof self.ort !== 'undefined') {
         configureOrt(a.base);
         return a.label;
@@ -78,7 +92,8 @@ function loadOrt(msg) {
   }
   throw new Error(
     '無法載入 onnxruntime-web\n' + errors.join('\n')
-    + '\n提示：若錯誤是 CORS-cross-origin，請用 ?reset=1 清除舊的 Service Worker 後再試。'
+    + '\n（跨來源 importScripts 在 WebKit 上本來就常被拒絕，'
+    + '正常路徑是主執行緒預抓的 blob；若 blob 那條也失敗，看它的錯誤訊息。）'
   );
 }
 
@@ -88,7 +103,7 @@ async function createSession(candidates, providers, preferredSize) {
     for (const ep of providers) {
       try {
         const opts = { executionProviders: [ep], graphOptimizationLevel: 'all' };
-        const s = await ort.InferenceSession.create(url, opts);
+        const s = await ortApi.InferenceSession.create(url, opts);
         const name = s.inputNames[0];
         // 暖機 + 尺寸探測：失敗就換下一個 EP / 模型，不要留下壞掉的 session
         const size = await probeInputSize(s, name, preferredSize);
@@ -140,7 +155,7 @@ async function probeInputSize(s, name, preferred) {
     try {
       const zeros = new Float32Array(3 * size * size);
       const feeds = {};
-      feeds[name] = new ort.Tensor('float32', zeros, [1, 3, size, size]);
+      feeds[name] = new ortApi.Tensor('float32', zeros, [1, 3, size, size]);
       const out = await s.run(feeds);
       // 順便確認輸出形狀是 YOLOv8 的 [1, 4+C, N]
       const o = out[s.outputNames[0]];
@@ -288,7 +303,7 @@ self.onmessage = async (ev) => {
       msg.bitmap.close();
       const tPre = performance.now();
       const feeds = {};
-      feeds[inputName] = new ort.Tensor('float32', geo.tensor, [1, 3, inputSize, inputSize]);
+      feeds[inputName] = new ortApi.Tensor('float32', geo.tensor, [1, 3, inputSize, inputSize]);
       const res = await session.run(feeds);
       const tInfer = performance.now();
       const boxes = decode(res[outputName], geo);
@@ -310,3 +325,4 @@ self.onmessage = async (ev) => {
     }
   }
 };
+})();
