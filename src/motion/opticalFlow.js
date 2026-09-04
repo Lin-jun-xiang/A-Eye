@@ -60,10 +60,19 @@ export class OpticalFlow {
   async loadCv(loadScript) {
     if (this.cvReady) return true;
     if (typeof cv === 'undefined') {
-      try {
-        await loadScript('https://docs.opencv.org/4.9.0/opencv.js');
-      } catch (e) {
-        console.warn('[A-Eye] OpenCV.js 載入失敗:', e.message);
+      const errors = [];
+      let loaded = false;
+      for (const url of this.cfg.flow.cvUrls) {
+        try {
+          await loadScript(url);
+          loaded = true;
+          break;
+        } catch (e) {
+          errors.push(`${url}: ${e.message}`);
+        }
+      }
+      if (!loaded) {
+        console.warn('[A-Eye] OpenCV.js 載入失敗:\n' + errors.join('\n'));
         return false;
       }
     }

@@ -23,37 +23,63 @@ let iouThreshold = 0.45;
 let canvas = null;
 let ctx = null;
 
-const ORT_VERSION = '1.20.1';
-// onnxruntime-web 不同版本的 bundle 檔名不完全一致，依序嘗試。
-// ort.all.* 含 webgpu + wasm；退回 ort.min.js（wasm）。
-const ORT_CANDIDATES = [
-  `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.all.min.js`,
-  `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.webgpu.min.js`,
-  `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.min.js`,
-  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js',
-];
+/**
+ * 載入 onnxruntime-web。
+ *
+ * 優先順序：
+ *   1. 主執行緒預先抓好的「同源 blob URL」
+ *   2. 直接 importScripts CDN（僅在 blob 那條路失敗時）
+ *
+ * 為什麼不直接 importScripts CDN：
+ *   worker 的 importScripts() 若被 Service Worker 攔截，SW 用 fetch() 重發
+ *   跨來源 no-cors 請求後拿到的是 opaque response，而 HTML 規範禁止
+ *   importScripts 接受 SW 提供的 opaque response —— WebKit 會丟出
+ *   「Network response is CORS-cross-origin」，即使 CDN 本身有送
+ *   access-control-allow-origin: *。改由主執行緒 fetch 成 blob 後就完全同源。
+ *
+ * wasmPaths 必須指回 CDN：那是 ORT 自己用 fetch() 發的 CORS 請求，
+ * 不受 importScripts 的限制。blob URL 沒有可用的相對基底，不能拿來當 base。
+ */
+function configureOrt(baseUrl) {
+  ort = self.ort;
+  try {
+    ort.env.wasm.wasmPaths = baseUrl;
+    ort.env.wasm.numThreads = Math.min(4, self.navigator?.hardwareConcurrency || 2);
+    ort.env.wasm.simd = true;
+    ort.env.logLevel = 'error';
+  } catch (_) { /* 舊版可能沒有某些欄位 */ }
+}
 
-function loadOrt() {
+function loadOrt(msg) {
+  const attempts = [];
+  if (msg.ortBlobUrl && msg.ortBaseUrl) {
+    attempts.push({
+      url: msg.ortBlobUrl,
+      base: msg.ortBaseUrl,
+      label: 'blob:' + (msg.ortSourceUrl || '').split('/').pop(),
+    });
+  }
+  for (const u of msg.ortFallbackUrls || []) {
+    attempts.push({ url: u, base: u.slice(0, u.lastIndexOf('/') + 1), label: u.split('/').pop() });
+  }
+
   const errors = [];
-  for (const url of ORT_CANDIDATES) {
+  for (const a of attempts) {
     try {
-      importScripts(url);
+      importScripts(a.url);
       if (typeof self.ort !== 'undefined') {
-        ort = self.ort;
-        const base = url.slice(0, url.lastIndexOf('/') + 1);
-        try {
-          ort.env.wasm.wasmPaths = base;
-          ort.env.wasm.numThreads = Math.min(4, self.navigator?.hardwareConcurrency || 2);
-          ort.env.wasm.simd = true;
-          ort.env.logLevel = 'error';
-        } catch (_) { /* 舊版可能沒有某些欄位 */ }
-        return url;
+        configureOrt(a.base);
+        return a.label;
       }
+      errors.push(`${a.label}: 載入成功但找不到全域 ort`);
     } catch (e) {
-      errors.push(`${url}: ${e.message}`);
+      errors.push(`${a.label}: ${e.message}`);
     }
   }
-  throw new Error('無法載入 onnxruntime-web\n' + errors.join('\n'));
+  throw new Error(
+    '無法載入 onnxruntime-web\n' + errors.join('\n')
+    + '\n提示：若錯誤是 CORS-cross-origin，請用 ?reset=1 清除舊的 Service Worker 後再試。'
+  );
 }
 
 async function createSession(candidates, providers, preferredSize) {
@@ -231,7 +257,7 @@ self.onmessage = async (ev) => {
 
   if (msg.type === 'init') {
     try {
-      const ortUrl = loadOrt();
+      const ortUrl = loadOrt(msg);
       keepClasses = msg.keepClasses || keepClasses;
       confThreshold = msg.confThreshold ?? confThreshold;
       iouThreshold = msg.iouThreshold ?? iouThreshold;
@@ -242,7 +268,7 @@ self.onmessage = async (ev) => {
         model: modelUrl.split('/').pop(),
         provider,
         inputSize,
-        ortUrl: ortUrl.split('/').pop(),
+        ortUrl,   // loadOrt() 已回傳精簡標籤
       });
     } catch (e) {
       self.postMessage({ type: 'error', message: e.message });

@@ -4,7 +4,7 @@
 // stale-while-revalidate 很容易讓不同版本的模組混在一起（極難除錯）。
 // 離線時才回退到快取。
 
-const CACHE = 'aeye-v8';
+const CACHE = 'aeye-v9';
 
 const FILES = [
   './',
@@ -55,16 +55,46 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
+
+  // 跨來源請求一律不攔截，直接讓瀏覽器自己去抓。
+  //
+  // 這不是效能考量，是正確性問題：SW 用 fetch() 重發跨來源的 no-cors 請求，
+  // 拿回來的是 opaque response。而 HTML 規範明確禁止 importScripts() 接受
+  // 由 Service Worker 提供的 opaque response，WebKit 會直接丟出
+  //   「Network response is CORS-cross-origin」
+  // 於是 worker 裡的 importScripts('https://cdn.jsdelivr.net/...ort.min.js')
+  // 一定失敗 —— 即使 CDN 本身送了 access-control-allow-origin: *。
+  //
+  // （v6 沒踩到是因為它用 <script> 標籤在主執行緒載入 ORT，
+  //   而 <script> 是接受 opaque response 的。）
+  //
+  // 不呼叫 respondWith() 就等於「交還給瀏覽器預設行為」，
+  // CDN 的大檔本來也該交給瀏覽器的 HTTP cache 管。
+  let sameOrigin;
+  try {
+    sameOrigin = new URL(req.url).origin === location.origin;
+  } catch (_) {
+    return;
+  }
+  if (!sameOrigin) return;
+
   e.respondWith(
     fetch(req)
       .then((r) => {
-        // 只快取同源且成功的回應（模型與 CDN 的大檔交給瀏覽器 HTTP cache）
-        if (r.ok && new URL(req.url).origin === location.origin) {
+        if (r.ok) {
           const clone = r.clone();
           caches.open(CACHE).then((c) => c.put(req, clone)).catch(() => {});
         }
         return r;
       })
-      .catch(() => caches.match(req))
+      // 離線時回退到快取；連快取都沒有就明確回一個 503，
+      // 不要回 undefined（那會變成難以診斷的 network error）
+      .catch(async () => {
+        const hit = await caches.match(req);
+        return hit || new Response('offline and not cached', {
+          status: 503,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        });
+      })
   );
 });

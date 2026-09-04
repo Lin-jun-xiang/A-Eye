@@ -256,8 +256,15 @@ async function start() {
     toggleBtn.disabled = false;
     toggleBtn.innerHTML = `${BTN_ICON} 開始偵測`;
     toggleBtn.className = 'start';
-    setStatus('❌ ' + (e.message || '啟動失敗'), false);
-    alerts.render([{ type: 'idle', text: '請確認相機 / 定位權限後重試' }]);
+    // 手機上沒有 console，所以錯誤全文要直接顯示在畫面上 ——
+    // 只顯示「請確認權限」會把真正的原因（模型載入、CORS、WebGPU…）蓋掉
+    const msg = String(e.message || '啟動失敗');
+    setStatus('❌ ' + msg.split('\n')[0], false);
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    alerts.render([{
+      type: 'red',
+      text: `<div style="font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all">${esc(msg)}</div>`,
+    }]);
     console.error('[A-Eye] 啟動失敗:', e);
   }
 }

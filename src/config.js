@@ -39,6 +39,18 @@ export const CONFIG = {
     // 只解碼我們要的類別 → 解碼迴圈從 8400×80 降到 8400×4
     keepClasses: [2, 5, 7, 9],   // car, bus, truck, traffic light
     providers: ['webgpu', 'wasm'],
+
+    // onnxruntime-web 的載入來源。
+    // 主執行緒會先用 fetch() 抓下來轉成同源 blob URL 再交給 worker，
+    // 因為 worker 直接 importScripts() 跨來源網址在 WebKit 上會失敗
+    // （若有 Service Worker 攔截，回應會變成 opaque，而規範禁止
+    //   importScripts 接受 opaque response）。抓不到才退回直接載入。
+    ortVersion: '1.20.1',
+    ortFiles: [
+      'ort.all.min.js',     // 含 webgpu + wasm
+      'ort.min.js',         // 預設 bundle
+      'ort.wasm.min.js',    // 純 wasm
+    ],
   },
 
   vehicleClasses: [2, 5, 7],
@@ -86,6 +98,14 @@ export const CONFIG = {
 
   // ---------- 光流 ----------
   flow: {
+    // OpenCV.js 來源（~10MB）。docs.opencv.org 沒有送 CORS 標頭，
+    // 所以只能用 <script> 標籤載入（no-cors），不能用 fetch。
+    // 依序嘗試，避免單一網址失效就整個起步偵測停擺。
+    cvUrls: [
+      'https://docs.opencv.org/4.9.0/opencv.js',
+      'https://docs.opencv.org/4.10.0/opencv.js',
+      'https://docs.opencv.org/4.8.0/opencv.js',
+    ],
     maxFgPoints: 80,
     maxBgPoints: 100,
     winSize: 21,

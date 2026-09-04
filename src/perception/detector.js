@@ -21,7 +21,51 @@ export class Detector {
     this.latencyMs = 0;
   }
 
+  /** onnxruntime-web 的 CDN 候選網址 */
+  ortUrls() {
+    const y = this.cfg.yolo;
+    const base = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${y.ortVersion}/dist/`;
+    return y.ortFiles.map((f) => base + f);
+  }
+
+  /**
+   * 把 ORT 抓下來轉成「同源 blob URL」。
+   *
+   * 為什麼要多這一步：worker 裡 importScripts() 一個跨來源網址，在 WebKit 上
+   * 會因為 Service Worker 把回應變成 opaque 而失敗（規範禁止 importScripts
+   * 接受 opaque response），錯誤訊息是「Network response is CORS-cross-origin」。
+   * 我們已經修好 sw.js 不再攔截跨來源，但使用者裝置上可能還留著舊的 SW，
+   * 所以這裡再加一層：主執行緒用 fetch()（走正常 CORS，jsDelivr 有送
+   * access-control-allow-origin: *）抓下來，轉成同源 blob，worker 載入 blob
+   * 就完全不涉及跨來源了。
+   *
+   * 注意 wasm 仍然從 CDN 抓 —— 那是 ORT 自己用 fetch() 發的 CORS 請求，
+   * 不受 importScripts 的限制，所以 baseUrl 一定要指回 CDN。
+   */
+  async _prepareOrt() {
+    const errors = [];
+    for (const url of this.ortUrls()) {
+      try {
+        const res = await fetch(url, { mode: 'cors', credentials: 'omit' });
+        if (!res.ok) { errors.push(`${url}: HTTP ${res.status}`); continue; }
+        const blob = await res.blob();
+        return {
+          blobUrl: URL.createObjectURL(blob),
+          baseUrl: url.slice(0, url.lastIndexOf('/') + 1),
+          sourceUrl: url,
+        };
+      } catch (e) {
+        errors.push(`${url}: ${e.message}`);
+      }
+    }
+    console.warn('[A-Eye] ORT 預先下載失敗，改由 worker 直接載入：\n' + errors.join('\n'));
+    return null;
+  }
+
   async init() {
+    const prepared = await this._prepareOrt();
+    this._ortBlobUrl = prepared ? prepared.blobUrl : null;
+
     return new Promise((resolve, reject) => {
       let settled = false;
       try {
@@ -59,6 +103,10 @@ export class Detector {
       this.worker.postMessage({
         type: 'init',
         baseUrl: new URL('../../', import.meta.url).href,
+        ortBlobUrl: prepared ? prepared.blobUrl : null,
+        ortBaseUrl: prepared ? prepared.baseUrl : null,
+        ortSourceUrl: prepared ? prepared.sourceUrl : null,
+        ortFallbackUrls: this.ortUrls(),
         modelCandidates: y.modelCandidates,
         providers: y.providers,
         preferredInputSize: y.preferredInputSize,
@@ -118,6 +166,7 @@ export class Detector {
   dispose() {
     if (this.worker) this.worker.terminate();
     this.worker = null;
+    if (this._ortBlobUrl) { URL.revokeObjectURL(this._ortBlobUrl); this._ortBlobUrl = null; }
     this.ready = false;
     // 必須清掉 inFlight：worker 被 terminate 後那筆請求永遠不會回來，
     // 若留著 true，重新啟動後 shouldSubmit() 會永遠回 false（整個偵測靜默）
