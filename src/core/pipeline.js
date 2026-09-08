@@ -19,6 +19,7 @@ import { DepartureDetector } from '../motion/departure.js';
 import { EgoMotionEstimator, EgoState } from '../motion/egoMotion.js';
 import { FrontCarSelector } from '../logic/frontCar.js';
 import { TrafficLightDetector } from '../logic/trafficLight.js';
+import { BrakeLightDetector } from '../logic/brakeLight.js';
 
 export class Pipeline {
   constructor({ cfg = CONFIG, gps = null, imu = null } = {}) {
@@ -31,6 +32,7 @@ export class Pipeline {
     this.departure = new DepartureDetector(cfg);
     this.ego = new EgoMotionEstimator(cfg, gps, imu);
     this.frontCar = new FrontCarSelector(cfg);
+    this.brake = new BrakeLightDetector(cfg);
     this.light = new TrafficLightDetector(cfg);
 
     this.enableCarDepart = true;
@@ -40,6 +42,10 @@ export class Pipeline {
     this.lastFlowTs = 0;
     this.lastFlowMs = 0;
     this.lastLightTs = 0;
+    this.lastBrakeTs = 0;
+    // trackId -> { ms, everOn }：某個框被觀察了多久、期間有沒有出現過剎車燈。
+    // 「觀察夠久卻始終沒有一對對稱的紅燈」是自車結構/反光的正向反證。
+    this.lampEvidence = new Map();
     this.lastTickTs = 0;
     this.visBgResid = null;
     this.imuDisagree = 0;
@@ -58,7 +64,10 @@ export class Pipeline {
     this.departure.reset();
     this.ego.reset();
     this.frontCar.reset();
+    this.brake.reset();
     this.light.reset();
+    this.lampEvidence.clear();
+    this.lastBrakeTs = 0;
     this.lastFlow = null;
     this.lastFlowTs = 0;
     this.lastTickTs = 0;
@@ -76,7 +85,10 @@ export class Pipeline {
   setFeatures({ car, light }) {
     if (car !== undefined) {
       this.enableCarDepart = car;
-      if (!car) { this.departure.reset(); this.flow.reset(); this.frontCar.reset(); }
+      if (!car) {
+        this.departure.reset(); this.flow.reset(); this.frontCar.reset();
+        this.brake.reset(); this.lampEvidence.clear();
+      }
     }
     if (light !== undefined) {
       this.enableTrafficLight = light;
@@ -116,15 +128,41 @@ export class Pipeline {
 
     let target = null;
     if (this.enableCarDepart) {
-      target = this.frontCar.select(vehTracks, vw, vh, now);
+      // 先學自車結構（引擎蓋 / 儀表板 / 反光被 YOLO 認成 car）。
+      // 它的底邊在畫面最下方 → proximity 最高 → 不排除就會永遠被選成「前車」，
+      // 於是光流量的是一個永遠不動的東西，起步警示結構上不可能觸發。
+      this.frontCar.learnEgoStructure(
+        vehTracks, vw, vh, now, this.ego.state === EgoState.MOVING
+      );
+      target = this.frontCar.select(vehTracks, vw, vh, now, {
+        lampWeightFn: (id) => this._lampWeight(id),
+      });
     }
     const targetChanged = target && this.target && target.id !== this.target.id;
     if (targetChanged) {
       // 換了目標 → 之前累積的證據對新目標無意義
       this.departure.reset();
       this.flow.reset();
+      this.brake.reset();
     }
     this.target = target;
+
+    // ---- 3.5) 剎車燈（快路徑）----
+    // 放在光流之前：它的結果會當成起步判定的先驗，而且比運動訊號早 0.3~1 秒。
+    let brakeRes = null;
+    if (this.enableCarDepart && target) {
+      const gap = 1000 / cfg.brakeLight.hz;
+      if (now - this.lastBrakeTs >= gap) {
+        const dtMs = this.lastBrakeTs ? now - this.lastBrakeTs : gap;
+        this.lastBrakeTs = now;
+        brakeRes = this.brake.update(source, target.boxAt(now), now);
+        this._noteLamp(target.id, brakeRes, dtMs);
+        const armed = now - target.firstTs >= cfg.departure.armMs;
+        if (brakeRes.released && cfg.brakeLight.alertOnRelease && canAlert && armed) {
+          events.push({ type: 'release', text: '🟠 前車鬆開剎車，準備起步', kind: 'release' });
+        }
+      }
+    }
 
     // ---- 4) 光流 + 起步判定 ----
     let flowRes = null;
@@ -132,7 +170,6 @@ export class Pipeline {
       const minGap = 1000 / cfg.loop.flowHz;
       if (now - this.lastFlowTs >= minGap) {
         const box = target.boxAt(now);      // KF 預測到「現在」，不是幾百毫秒前的舊框
-        const prevTs = this.lastFlowTs || now;
         const tf0 = performance.now();
         flowRes = this.flow.measure(source, box, vw, vh, now);
         this.lastFlowMs = performance.now() - tf0;
@@ -141,11 +178,16 @@ export class Pipeline {
 
         if (flowRes.ok) {
           this.stats.flowOk++;
-          this._crossCheckImu(flowRes, prevTs, now);
+          // 用量測自己的時間區間（不是「距上一幀」）積分陀螺儀，
+          // 才能和背景位移對得起來
+          this._crossCheckImu(flowRes, flowRes.t0, flowRes.t1);
           const r = this.departure.update(flowRes, {
             ts: now,
             egoStill: canAlert,
             trusted: this.trusted,
+            primed: this.brake.primed(now),
+            priorLlr: this.brake.priorLlr(),
+            armed: now - target.firstTs >= cfg.departure.armMs,
           });
           if (r.fired) events.push({ type: 'move', text: '🚗 前車已起步！', kind: 'depart' });
         } else {
@@ -185,12 +227,20 @@ export class Pipeline {
         tracks: this.tracker.tracks.map((t) => ({
           id: t.id, classId: t.classId, box: t.boxAt(now),
           confirmed: t.confirmed, score: t.score,
-          coasting: now - t.lastSeenTs > 60,
+          // 「還沒被新的偵測更新」的門檻要跟偵測週期綁在一起。寫死 60ms 的話，
+          // detectHz=8（125ms 一次）會讓每個框幾乎永遠是虛線。
+          coasting: now - t.lastSeenTs > 1.8 * (1000 / cfg.loop.detectHz),
         })),
         horizon: this.frontCar.horizon,
         laneCenterX: this.frontCar.laneCenterX,
+        egoRegions: this.frontCar.egoRegions,
         corridor: this._corridorPoly(vw, vh),
         departure: this.departure.status(now),
+        brake: brakeRes,
+        brakeState: this.brake.state,
+        brakePrimed: this.brake.primed(now),
+        brakeDetail: this.brake.lastDetail,
+        brakeCfg: cfg.brakeLight,
         flow: flowRes,
         lastFlow: this.lastFlow,
         light: lightInfo,
@@ -242,6 +292,28 @@ export class Pipeline {
     this.imu.teachImageMotion(rot, obs);
   }
 
+  /** 累積「這個框被觀察了多久、期間有沒有出現剎車燈」 */
+  _noteLamp(id, res, dtMs) {
+    if (!res || !res.usable) return;          // 過曝/裁切失敗不算證據
+    let e = this.lampEvidence.get(id);
+    if (!e) { e = { ms: 0, everOn: false }; this.lampEvidence.set(id, e); }
+    e.ms += dtMs;
+    if (res.everOn) e.everOn = true;
+    // 只保留還活著的 track，避免長時間行駛後 Map 無限成長
+    if (this.lampEvidence.size > 32) {
+      const alive = new Set(this.tracker.tracks.map((t) => t.id));
+      for (const k of this.lampEvidence.keys()) if (!alive.has(k)) this.lampEvidence.delete(k);
+    }
+  }
+
+  /** 剎車燈的正向證據加權：預設中性，只有「看夠久卻沒燈」才降權 */
+  _lampWeight(id) {
+    const p = this.cfg.frontCar.plausibility;
+    const e = this.lampEvidence.get(id);
+    if (!e || e.everOn) return 1;
+    return e.ms >= p.noLampAfterMs ? p.noLampWeight : 1;
+  }
+
   _corridorPoly(vw, vh) {
     const fc = this.frontCar;
     const pts = [];
@@ -258,6 +330,7 @@ export class Pipeline {
     l.push(this.ego.debugLine());
     l.push(this.frontCar.debugLine());
     l.push(this.departure.debugLine());
+    l.push(this.brake.debugLine());
     if (this.lastFlow) {
       const f = this.lastFlow;
       l.push(f.ok

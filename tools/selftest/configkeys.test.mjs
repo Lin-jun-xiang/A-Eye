@@ -42,11 +42,17 @@ const allSrc = walk('src')
   .map((f) => readFileSync(f, 'utf8'))
   .join('\n');
 const unused = [];
+// 遞迴：巢狀群組（frontCar.plausibility.*、frontCar.egoStructure.*）也要檢查，
+// 否則新加的巢狀死參數根本不會被發現
+const scan = (obj, path) => {
+  for (const [key, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) { scan(v, `${path}.${key}`); continue; }
+    if (!new RegExp('\\b' + key + '\\b').test(allSrc)) unused.push(`${path}.${key}`);
+  }
+};
 for (const [group, g] of Object.entries(CONFIG)) {
   if (typeof g !== 'object' || Array.isArray(g)) continue;
-  for (const key of Object.keys(g)) {
-    if (!new RegExp(`\\b${key}\\b`).test(allSrc)) unused.push(`${group}.${key}`);
-  }
+  scan(g, group);
 }
 console.log(unused.length
   ? `  ⚠ 定義了但沒被讀取的參數：${unused.join(', ')}`

@@ -51,11 +51,19 @@ export class DepartureDetector {
     this.aboveSinceTs = 0;    // z_kf 連續達標的起始時刻
     this.upBuf = [];          // 近期 dyRel 的符號（佐證用）
     this.lastMeasTs = 0;
+    // 衰減的參考時刻。coast() 每幀都會被呼叫（光流在累積基線時、
+    // 重新錨定時、點數不足時都算沒有量測），若每次都拿
+    // 「距上一筆量測的時間」當衰減量，同一段時間會被重複扣，
+    // 證據被超線性地打掉 —— 這正是「該報的時候剛好沒報」的機制之一。
+    this.lastDecayTs = 0;
     // -Infinity 而不是 0：否則啟動後的前 cooldownMs 毫秒內冷卻檢查永遠不通過
     this.lastFireTs = -Infinity;
     this.lastReason = 'idle';
     this.lastZ = 0;
     this.lastZRaw = 0;
+    // 剎車燈熄滅的先驗只能加一次，不能每個 tick 重複加 ——
+    // 重複計入同一份證據正是 v6 SPRT 的原始錯誤，不能在這裡犯第二次
+    this.priorApplied = false;
   }
 
   /** 目標徹底遺失（超過 coast 時間）才呼叫；短暫遺失請用 coast() */
@@ -72,23 +80,31 @@ export class DepartureDetector {
       this.lastReason = 'lost';
       return;
     }
-    const dt = this.lastMeasTs ? (ts - this.lastMeasTs) / 1000 : 0;
+    // 只扣「上次衰減到現在」這一小段，不是「距上一筆量測」的全長
+    const dt = this.lastDecayTs ? (ts - this.lastDecayTs) / 1000 : 0;
+    this.lastDecayTs = ts;
     if (dt > 0) {
       this.Vvar += d.qV * dt;                       // 不確定度隨時間膨脹
       this.llr *= Math.exp(-dt / d.llrDecayTau);    // 證據隨時間衰減
     }
-    this.aboveSinceTs = 0;
+    // 注意：不清掉 aboveSinceTs。dwell 要衡量的是「z 有沒有持續達標」，
+    // 而光流在累積基線的那幾幀本來就沒有新量測，
+    // 若每幀都把 dwell 歸零，dwell 這道閘門永遠不可能通過。
   }
 
   /**
    * 餵入一筆光流量測。
    * @param m  OpticalFlow.measure() 的成功回傳
-   * @param ctx { ts, egoStill, trusted }
+   * @param ctx { ts, egoStill, trusted, primed, priorLlr, armed }
+   *   primed   剎車燈剛熄滅 → 起步的先驗機率大幅提高
+   *   priorLlr 該先驗的對數勝算比 ln(P(熄燈│起步)/P(熄燈│不起步))
+   *   armed    目標已被連續追蹤足夠久（掠過的機車/切入車不該武裝）
    * @returns { fired: bool, status: {...} }
    */
   update(m, ctx) {
     const d = this.cfg.departure;
     const ts = ctx.ts;
+    const primed = !!ctx.primed;
 
     if (!ctx.egoStill) {
       this.reset();
@@ -122,7 +138,7 @@ export class DepartureDetector {
     if (!this.inited) {
       this.V = vMeas; this.Vvar = vVarMeas; this.inited = true;
     } else {
-      const dtSec = this.lastMeasTs ? (ts - this.lastMeasTs) / 1000 : m.dt;
+      const dtSec = this.lastDecayTs ? (ts - this.lastDecayTs) / 1000 : m.dt;
       this.Vvar += d.qV * Math.max(dtSec, 0);
       const K = this.Vvar / (this.Vvar + vVarMeas);
       this.V += K * (vMeas - this.V);
@@ -137,20 +153,36 @@ export class DepartureDetector {
     //   H1: z ~ N(mu, 1)     （起步）
     //   單筆 LLR = mu·z − mu²/2
     const mu = d.effectSize;
-    const dtSec = this.lastMeasTs ? (ts - this.lastMeasTs) / 1000 : m.dt;
-    this.llr *= Math.exp(-Math.max(dtSec, 0) / d.llrDecayTau);
+    const dtDecay = this.lastDecayTs ? (ts - this.lastDecayTs) / 1000 : m.dt;
+    this.llr *= Math.exp(-Math.max(dtDecay, 0) / d.llrDecayTau);
     this.llr += mu * zRaw - (mu * mu) / 2;
+
+    // ---- 先驗：剎車燈熄滅是一個獨立來源的證據 ----
+    // SPRT 累積的就是對數勝算比，所以先驗機率的改變剛好是「加一個常數」。
+    // 這在數學上是乾淨的貝氏更新，而且結構上不可能單獨觸發：
+    // 鬆了剎車但車不動 → 運動證據永遠不來 → LLR 停在先驗那一格然後被衰減掉。
+    if (primed && !this.priorApplied) {
+      this.llr += ctx.priorLlr || 0;
+      this.priorApplied = true;
+    }
+    if (!primed) this.priorApplied = false;
+
     if (this.llr <= this.th.sprtB) this.llr = 0;           // 確認非起步 → 歸零重算
 
     // ---- 佐證：影像上前車應同時往地平線方向移動（dyRel < 0）----
-    this.upBuf.push(m.dyRel <= 0 ? 1 : 0);
-    if (this.upBuf.length > 20) this.upBuf.shift();
-    const upRatio = this.upBuf.length >= 4
+    // 只有位移量超過雜訊尺度的量測才投票：次像素雜訊的符號是擲硬幣，
+    // 讓它進投票池只會把比例鎖在 0.5 附近，等於一道隨機閘門。
+    if (Math.abs(m.dyRel) >= d.upwardMinPx) {
+      this.upBuf.push(m.dyRel <= 0 ? 1 : 0);
+      if (this.upBuf.length > d.upwardWindow) this.upBuf.shift();
+    }
+    const upRatio = this.upBuf.length >= 3
       ? this.upBuf.reduce((a, b) => a + b, 0) / this.upBuf.length
       : 0;
 
     this.ticks++;
     this.lastMeasTs = ts;
+    this.lastDecayTs = ts;
 
     // ---- 觸發條件 ----
     const condKf = zKf >= this.th.zFire;
@@ -163,14 +195,21 @@ export class DepartureDetector {
     } else {
       this.aboveSinceTs = 0;
     }
-    const dwellOk = this.aboveSinceTs > 0 && (ts - this.aboveSinceTs) >= d.dwellMs;
-    const ticksOk = this.ticks >= d.minTicks;
+    // 有獨立證據時放寬自我佐證的量（dwell 與 minTicks 的存在理由是
+    // 「防止模型誤差的瞬時尖峰獨力觸發」，一個獨立來源正當地降低了這個需求）
+    const needDwell = primed ? d.dwellMsPrimed : d.dwellMs;
+    const needTicks = primed ? d.minTicksPrimed : d.minTicks;
+    const dwellOk = this.aboveSinceTs > 0 && (ts - this.aboveSinceTs) >= needDwell;
+    const ticksOk = this.ticks >= needTicks;
     const cooldownOk = ts - this.lastFireTs > d.cooldownMs;
+    const armedOk = ctx.armed !== false;
 
     const statTest = d.requireBoth ? (condKf && condSprt) : (condKf || condSprt);
-    const fired = statTest && condPhysical && condUp && dwellOk && ticksOk && cooldownOk;
+    const fired = statTest && condPhysical && condUp && dwellOk && ticksOk
+      && cooldownOk && armedOk;
 
     this.lastReason = fired ? 'FIRE'
+      : !armedOk ? 'not-armed'
       : !condPhysical ? 'below-min-ttc'
       : !condKf ? 'z-low'
       : !condSprt ? 'llr-low'
@@ -187,9 +226,10 @@ export class DepartureDetector {
       this.ticks = 0;
       this.aboveSinceTs = 0;
       this.upBuf.length = 0;
+      this.priorApplied = false;
     }
 
-    return { fired, status: this.status(ts, { upRatio, zRaw, condKf, condSprt, condPhysical, condUp, dwellOk }) };
+    return { fired, status: this.status(ts, { upRatio, zRaw, condKf, condSprt, condPhysical, condUp, dwellOk, primed }) };
   }
 
   status(ts, extra = {}) {

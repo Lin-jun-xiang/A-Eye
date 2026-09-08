@@ -48,10 +48,12 @@ let hidden = false;
 let hiddenTimer = null;
 let vw = 0, vh = 0;
 let lastEventText = '';
+let lastEventKind = '';
 let lastEventTs = 0;
 const eventLog = [];
 
 const BTN_ICON = '<svg class="btn-icon"><use href="#logo"/></svg>';
+const BRAKE_LABEL = { on: '亮', off: '熄', unknown: '?' };
 
 // ---------- 小工具 ----------
 function loadScript(src) {
@@ -118,6 +120,7 @@ function onFrame(now) {
   for (const ev of events) {
     alerts.fire(ev);
     lastEventText = ev.text;
+    lastEventKind = ev.kind;
     lastEventTs = now;
     eventLog.push({ t: Math.round(now), kind: ev.kind });
     if (CONFIG.debug.logEvents) {
@@ -150,9 +153,12 @@ function onFrame(now) {
 function renderBadges(hud, now) {
   const badges = [];
 
-  // 剛觸發的事件停留 3 秒
-  if (lastEventText && now - lastEventTs < 3000) {
-    badges.push({ type: lastEventText.includes('綠燈') ? 'green' : 'move', text: lastEventText });
+  // 剛觸發的事件停留 3 秒（「鬆剎車」只留 1.5 秒，它只是預告）
+  const hold = lastEventKind === 'release' ? 1500 : 3000;
+  if (lastEventText && now - lastEventTs < hold) {
+    const type = lastEventKind === 'green' ? 'green'
+      : lastEventKind === 'release' ? 'red' : 'move';
+    badges.push({ type, text: lastEventText });
   }
 
   if (!pipeline.enableCarDepart && !pipeline.enableTrafficLight) {
@@ -168,9 +174,12 @@ function renderBadges(hud, now) {
   }
 
   if (pipeline.enableCarDepart) {
+    // 光流還沒載好不代表什麼都不能做 —— 剎車燈快路徑不需要 OpenCV，
+    // 所以這條只是資訊，不再取代下面的追蹤徽章
     if (!pipeline.flow.cvReady) {
-      badges.push({ type: 'idle', text: '⏳ 載入光流引擎中...' });
-    } else if (!hud.target) {
+      badges.push({ type: 'idle', text: '⏳ 載入光流引擎中（剎車燈偵測已可用）' });
+    }
+    if (!hud.target) {
       badges.push({ type: 'idle', text: '👀 尋找前車...' });
     } else {
       const d = hud.departure;
@@ -180,7 +189,11 @@ function renderBadges(hud, now) {
       ));
       badges.push({
         type: 'idle',
-        text: `🚗 追蹤前車 #${hud.target.id}｜證據 ${pct}%${ttc}`
+        // 把「為什麼還沒報」直接寫在畫面上 —— 實車測試時手機沒有 console，
+        // 只看得到證據百分比的話，完全無法區分「訊號不足」和「某道閘門卡住」。
+        text: `🚗 追蹤前車 #${hud.target.id}｜證據 ${pct}%${ttc}｜${d.reason}`
+          + `｜剎車燈 ${BRAKE_LABEL[hud.brakeState] || '?'}`
+          + (hud.brakePrimed ? '⚡已預備' : '')
           + (hud.trusted ? '' : '｜⚠背景不可信'),
       });
     }

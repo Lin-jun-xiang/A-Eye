@@ -40,6 +40,12 @@ function project(Z, X, jitter = 0, classId = 2, score = 0.85) {
   };
 }
 
+let failCount = 0;
+const ok = (label, cond, extra = '') => {
+  console.log(`  ${cond ? '✅' : '✗ '} ${label}${extra ? '  ' + extra : ''}`);
+  if (!cond) failCount++;
+};
+
 console.log(`場景參數：f=${F.toFixed(0)}px、相機高 ${H_CAM}m、地平線 y=${Y_HOR.toFixed(0)}px`);
 console.log('');
 
@@ -181,3 +187,111 @@ for (const HZ of [1, 2, 4, 8, 20]) {
     + `        ${minEma < 0.15 ? '會 ✗' : '不會 '}       |   ${minKf < CONFIG.tracker.iouGate ? '會 ✗' : '不會 ✓'}`
     + `  (id數 ${ids.size})`);
 }
+
+
+console.log('');
+console.log('=== 自車結構（引擎蓋／儀表板被 YOLO 認成 car）不得贏過真前車 ===');
+// v7 首次路測的實際症狀：綠框框住自己的引擎蓋，於是光流量的是一個永遠不動
+// 的東西 —— 起步警示在結構上不可能觸發。
+//
+// 假框為什麼必定贏：score 的第一項 proximity 直接由 bbox 底邊高度決定，
+// 而引擎蓋的底邊就在畫面最下方 → proximity = 1.00，任何真前車都比不過。
+//
+// 修法刻意「不用硬性排除」：手機架高看不到引擎蓋時，3 公尺內的真前車
+// 底邊會被畫面下緣裁掉，任何「底邊太低就排除」的規則都會誤殺它。
+// 改成三項軟性加權相乘，每一項都由實體尺寸推導：
+//   (a) 車尾長寬比      (b) w_px/Δy = 車寬/相機高（焦距自己消掉）
+//   (c) 有沒有出現過一對對稱的剎車燈（正向證據，自車結構永遠不會有）
+{
+  const hood = { x: VW * 0.12, y: VH * 0.62, w: VW * 0.76, h: VH * 0.38, classId: 2, score: 0.42 };
+  const car = project(8, 0);
+  const sel = new FrontCarSelector(CONFIG);
+  sel.aspect = VH / VW;
+
+  const proxOf = (b) => ((b.y + b.h) / VH - sel.horizon) / (1 - sel.horizon);
+  const scoreOf = (b) => proxOf(b) * sel.plausibility(b, VW, VH) * sel.corridorWeight(b, VW, VH);
+  console.log(`  引擎蓋: aspect=${(hood.w / hood.h).toFixed(2)}`
+    + ` w/dy=${sel.groundRatio(hood, VW, VH).toFixed(2)}`
+    + ` plaus=${sel.plausibility(hood, VW, VH).toFixed(2)}`
+    + ` prox=${proxOf(hood).toFixed(2)} → score=${scoreOf(hood).toFixed(3)}`);
+  console.log(`  8m前車 : aspect=${(car.w / car.h).toFixed(2)}`
+    + ` w/dy=${sel.groundRatio(car, VW, VH).toFixed(2)}`
+    + ` plaus=${sel.plausibility(car, VW, VH).toFixed(2)}`
+    + ` prox=${proxOf(car).toFixed(2)} → score=${scoreOf(car).toFixed(3)}`);
+  ok('真前車分數高於引擎蓋假框（連剎車燈證據都還沒用上）',
+    scoreOf(car) > scoreOf(hood));
+  ok('但引擎蓋沒有被硬性排除（刻意的：硬排除會誤殺被裁切的近車）',
+    sel.isCandidate(hood, VW, VH));
+
+  const tr = new Tracker(CONFIG);
+  let picked = null;
+  for (let i = 0; i < 24; i++) {
+    const ts = i * 125;
+    tr.update([hood, car], ts);
+    const t = sel.select(tr.confirmedOf(CONFIG.vehicleClasses, ts), VW, VH, ts);
+    if (t) picked = t;
+  }
+  const carTrack = tr.tracks.find((t) => iou(t.boxAt(2875), car) > 0.8);
+  ok('實際選取鎖定真前車', !!picked && !!carTrack && picked.id === carTrack.id,
+    `選中 id=${picked && picked.id} 真前車 id=${carTrack && carTrack.id}`);
+
+  // 加上「看很久卻沒有剎車燈」的證據後，差距應該更大
+  const lampW = (id) => (carTrack && id === carTrack.id ? 1 : CONFIG.frontCar.plausibility.noLampWeight);
+  ok('剎車燈正向證據把差距再拉開',
+    scoreOf(car) * 1 > scoreOf(hood) * CONFIG.frontCar.plausibility.noLampWeight * 2,
+    `${(scoreOf(car)).toFixed(3)} vs ${(scoreOf(hood) * CONFIG.frontCar.plausibility.noLampWeight).toFixed(3)}`);
+  void lampW;
+}
+
+console.log('');
+console.log('=== 反向保護：手機架高、看不到引擎蓋，3m 內的近車底邊被畫面裁掉 ===');
+// 這正是「底邊貼齊畫面最下緣就排除」那條硬編碼規則會誤殺的情形。
+{
+  const sel = new FrontCarSelector(CONFIG);
+  sel.aspect = VH / VW;
+  const raw = project(3, 0);                       // 3m：底邊落在畫面之外
+  const clipped = { ...raw };
+  clipped.h = Math.min(raw.h, VH - raw.y);         // 被畫面下緣裁掉
+  console.log(`  未裁切底邊 y=${((raw.y + raw.h) / VH).toFixed(3)}（超出畫面）`
+    + ` → 裁切後 y=${((clipped.y + clipped.h) / VH).toFixed(3)}`);
+  console.log(`  裁切後: aspect=${(clipped.w / clipped.h).toFixed(2)}`
+    + ` w/dy=${sel.groundRatio(clipped, VW, VH).toFixed(2)}`
+    + ` plaus=${sel.plausibility(clipped, VW, VH).toFixed(3)}`);
+  ok('被裁切的近車仍是候選', sel.isCandidate(clipped, VW, VH));
+  ok('且幾何可信度沒有被扣分（> 0.9）', sel.plausibility(clipped, VW, VH) > 0.9);
+}
+
+console.log('');
+console.log('=== 自車結構黑名單：只在自車行駛中學習 ===');
+{
+  const dash = { x: VW * 0.30, y: VH * 0.70, w: VW * 0.34, h: VH * 0.22, classId: 2, score: 0.45 };
+  const sel = new FrontCarSelector(CONFIG);
+  sel.aspect = VH / VW;
+  const tr = new Tracker(CONFIG);
+
+  let learnedAt = null;
+  for (let i = 0; i < 40; i++) {
+    const ts = i * 125;                       // 5 秒、8Hz
+    tr.update([dash], ts);
+    sel.learnEgoStructure(tr.confirmedOf(CONFIG.vehicleClasses, ts), VW, VH, ts, true);
+    if (learnedAt === null && sel.egoRegions.length) learnedAt = ts;
+  }
+  ok(`自車行駛中 ${learnedAt} ms 後列入黑名單（門檻 ${CONFIG.frontCar.egoStructure.learnWhileMovingMs}ms）`,
+    learnedAt !== null);
+  ok('之後被硬性排除', !sel.isCandidate(dash, VW, VH));
+
+  // 反向保護：紅燈停車時前車也不動，此時絕不能學
+  const sel2 = new FrontCarSelector(CONFIG);
+  const tr2 = new Tracker(CONFIG);
+  const still = project(8, 0);
+  for (let i = 0; i < 240; i++) {              // 30 秒紅燈
+    const ts = i * 125;
+    tr2.update([still], ts);
+    sel2.learnEgoStructure(tr2.confirmedOf(CONFIG.vehicleClasses, ts), VW, VH, ts, false);
+  }
+  ok('自車靜止 30 秒（紅燈）後沒有誤學真前車', sel2.egoRegions.length === 0);
+}
+
+console.log('');
+console.log(failCount ? `❌ ${failCount} 項未通過` : '✅ 全部通過');
+if (failCount) process.exitCode = 1;

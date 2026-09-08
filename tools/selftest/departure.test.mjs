@@ -134,3 +134,29 @@ for (const [nBad, magSigma] of [[1, 20], [1, 100], [3, 20], [5, 10], [10, 5]]) {
   }
   console.log(`  ${nBad} 個連續 ${magSigma}σ 的一致離群 tick → ${fires} 次誤警`);
 }
+
+console.log('');
+console.log('=== coast() 的衰減不得重複計算同一段時間 ===');
+// 光流不是每一幀都產生量測（累積基線中、重新錨定、點數不足都算沒量測），
+// 所以 coast() 會以視訊幀率被呼叫。若衰減量用「距上一筆量測的時間」，
+// 同一段時間會被扣好幾次，證據被超線性打掉 —— 該報的時候剛好報不出來。
+{
+  const tau = CONFIG.departure.llrDecayTau;
+  const build = () => {
+    const det = new DepartureDetector(CONFIG);
+    for (let i = 0; i < 6; i++) {
+      det.update(makeMeas(-SIGMA_LOG * 3, -1), { ts: i * 50, egoStill: true, trusted: true });
+    }
+    return det;
+  };
+  const gapMs = 400;                      // 空白 400ms，理論衰減 exp(-0.4/tau)
+  const a = build(), b = build();
+  const llr0 = a.llr;
+  a.coast(250 + gapMs);                   // 一次呼叫
+  for (let i = 1; i <= 12; i++) b.coast(250 + (gapMs / 12) * i);   // 每 33ms 呼叫一次
+  const expect = llr0 * Math.exp(-gapMs / 1000 / tau);
+  console.log(`  LLR ${llr0.toFixed(2)} 空白 ${gapMs}ms 後：`
+    + `理論 ${expect.toFixed(3)}｜呼叫 1 次 ${a.llr.toFixed(3)}｜呼叫 12 次 ${b.llr.toFixed(3)}`);
+  const ok = Math.abs(a.llr - b.llr) < 1e-9 && Math.abs(a.llr - expect) < 1e-6;
+  console.log(`  → ${ok ? '✅ 與呼叫次數無關' : '✗ 衰減量取決於呼叫次數'}`);
+}

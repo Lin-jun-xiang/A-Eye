@@ -47,8 +47,14 @@ export class OpticalFlow {
     this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
 
     this.prevGray = null;       // cv.Mat
-    this.fgPts = null;          // [x0,y0,x1,y1,...] ROI 座標
+    this.fgPts = null;          // [x0,y0,x1,y1,...] ROI 座標（目前位置）
     this.bgPts = null;
+    // 量測基線的參考位置：與 fgPts / bgPts 同順序、同長度，
+    // 記錄「這些點在 refTs 時刻的位置」。尺度是拿 ref → cur 擬合出來的，
+    // 不是相鄰兩幀 —— 相鄰兩幀的尺度變化被雜訊淹沒。
+    this.fgRef = null;
+    this.bgRef = null;
+    this.refTs = 0;
     this.anchor = null;         // { x, y, w, h } 影像座標（整數）
     this.roiScale = 1;
     this.roiW = 0; this.roiH = 0;
@@ -96,6 +102,9 @@ export class OpticalFlow {
     this.prevGray = null;
     this.fgPts = null;
     this.bgPts = null;
+    this.fgRef = null;
+    this.bgRef = null;
+    this.refTs = 0;
     this.anchor = null;
     this.targetAtSample = null;
     this.lastSampleTs = 0;
@@ -221,9 +230,27 @@ export class OpticalFlow {
       this.bgPts = this._sampleInMask(gray, bgMask, this.cfg.flow.maxBgPoints);
 
       this.lastSampleTs = ts;
+      this._resetRef(ts);
     } finally {
       bag.freeAll();
     }
+  }
+
+  /** 把「現在的位置」設為新的量測基線起點 */
+  _resetRef(ts) {
+    this.fgRef = this.fgPts ? Float32Array.from(this.fgPts) : null;
+    this.bgRef = this.bgPts ? Float32Array.from(this.bgPts) : null;
+    this.refTs = ts;
+  }
+
+  /** 依 LK 存活點的索引，同步篩選基線參考位置 */
+  static _pick(src, idx) {
+    const out = new Float32Array(idx.length * 2);
+    for (let k = 0; k < idx.length; k++) {
+      out[k * 2] = src[idx[k] * 2];
+      out[k * 2 + 1] = src[idx[k] * 2 + 1];
+    }
+    return out;
   }
 
   /**
@@ -253,7 +280,7 @@ export class OpticalFlow {
       cv.calcOpticalFlowPyrLK(nextGray, prevGray, p1, p2, st2, er2, win, f.pyrLevels, crit);
     } catch (e) { return null; }
 
-    const prev = [], next = [];
+    const prev = [], next = [], idx = [];
     const fbMax = f.fbErrorPx;
     for (let i = 0; i < n; i++) {
       if (st1.data[i] !== 1 || st2.data[i] !== 1) continue;
@@ -263,10 +290,10 @@ export class OpticalFlow {
       if (nx < 0 || ny < 0 || nx >= this.roiW || ny >= this.roiH) continue;
       // forward-backward 誤差：追出去再追回來，回不到原點就是追丟了
       if (Math.hypot(bx - px, by - py) > fbMax) continue;
-      prev.push(px, py); next.push(nx, ny);
+      prev.push(px, py); next.push(nx, ny); idx.push(i);
     }
     if (prev.length < 6) return null;
-    return { prev: Float32Array.from(prev), next: Float32Array.from(next) };
+    return { prev: Float32Array.from(prev), next: Float32Array.from(next), idx };
   }
 
   /**
@@ -354,7 +381,8 @@ export class OpticalFlow {
         !this.anchor ||
         !this.prevGray ||
         !this._targetInsideAnchor(target) ||
-        !this.fgPts || this.fgPts.length / 2 < f.minFgPoints ||
+        !this.fgPts || !this.fgRef || !this.bgPts || !this.bgRef ||
+        this.fgPts.length / 2 < f.minFgPoints ||
         (ts - this.lastSampleTs) > f.resampleMs;
 
       if (needAnchor) {
@@ -389,23 +417,36 @@ export class OpticalFlow {
       const targetRoi = this._toRoi(target);
 
       // ---- 前景點：先剔除跑出目標框的（v6 缺這一步，追丟的點會繼續投票）----
-      const keptFg = [];
+      // 基線參考位置 fgRef 必須跟著一起篩，否則兩個陣列的第 i 個點不再是同一個點。
+      const keptFg = [], keptFgRef = [];
       const pad = 3;
       for (let i = 0; i < this.fgPts.length / 2; i++) {
         const x = this.fgPts[i * 2], y = this.fgPts[i * 2 + 1];
         if (x < targetRoi.x - pad || y < targetRoi.y - pad ||
             x > targetRoi.x + targetRoi.w + pad || y > targetRoi.y + targetRoi.h + pad) continue;
         keptFg.push(x, y);
+        keptFgRef.push(this.fgRef[i * 2], this.fgRef[i * 2 + 1]);
       }
       const fgIn = Float32Array.from(keptFg);
+      const fgRefIn = Float32Array.from(keptFgRef);
+      const bgRefIn = this.bgRef;
 
       const fgTrack = this._trackLK(this.prevGray, gray, fgIn, bag);
       const bgTrack = this._trackLK(this.prevGray, gray, this.bgPts, bag);
 
       // 推進 prev（無論本 tick 量測成功與否）
       const advance = () => {
-        if (fgTrack) this.fgPts = fgTrack.next;
-        if (bgTrack) this.bgPts = bgTrack.next;
+        if (fgTrack) {
+          this.fgPts = fgTrack.next;
+          this.fgRef = OpticalFlow._pick(fgRefIn, fgTrack.idx);
+        } else {
+          this.fgPts = fgIn;
+          this.fgRef = fgRefIn;
+        }
+        if (bgTrack) {
+          this.bgPts = bgTrack.next;
+          this.bgRef = OpticalFlow._pick(bgRefIn, bgTrack.idx);
+        }
         if (this.prevGray && !this.prevGray.isDeleted()) this.prevGray.delete();
         this.prevGray = gray;
         gray = null;
@@ -414,22 +455,37 @@ export class OpticalFlow {
 
       if (!fgTrack || fgTrack.prev.length / 2 < f.minFgPoints) {
         advance();
+        this._resetRef(ts);      // 點數已變，舊基線的統計意義沒了
         return { ok: false, reason: 'fg-too-few', dt };
       }
       if (!bgTrack || bgTrack.prev.length / 2 < f.minBgPoints) {
         advance();
+        this._resetRef(ts);
         return { ok: false, reason: 'bg-too-few', dt };
       }
 
-      const fgFit = this._fitSimilarity(fgTrack.prev, fgTrack.next, bag);
-      const bgFit = this._fitSimilarity(bgTrack.prev, bgTrack.next, bag);
       advance();
 
-      if (!fgFit) return { ok: false, reason: 'fg-fit-fail', dt };
-      if (!bgFit) return { ok: false, reason: 'bg-fit-fail', dt };
+      // ---- 只有累積到足夠的基線長度才產生一筆量測 ----
+      // 訊號（log 尺度變化）∝ 基線長度，雜訊（LK 次像素誤差）與基線長度無關。
+      // 相鄰兩幀（40ms）的尺度變化在雜訊底下，所以這裡等到 baselineMs
+      // 才用 ref → cur 擬合一次，且擬完立刻把 ref 移到現在
+      //（不重疊 → 相鄰量測近似獨立 → SPRT 的累積才不會重複計算同一份證據）。
+      const baseDt = (ts - this.refTs) / 1000;
+      if (baseDt * 1000 < f.baselineMs) {
+        return { ok: false, reason: 'accumulating', dt: baseDt };
+      }
+      const refTs = this.refTs;
+
+      const fgFit = this._fitSimilarity(this.fgRef, this.fgPts, bag);
+      const bgFit = this._fitSimilarity(this.bgRef, this.bgPts, bag);
+      this._resetRef(ts);
+
+      if (!fgFit) return { ok: false, reason: 'fg-fit-fail', dt: baseDt };
+      if (!bgFit) return { ok: false, reason: 'bg-fit-fail', dt: baseDt };
       if (bgFit.inlierRatio < f.minBgInlierRatio) {
         // 背景 inlier 太少 = 背景本身不一致（多半是旁車道車流佔了多數）
-        return { ok: false, reason: 'bg-inconsistent', dt, bgInlierRatio: bgFit.inlierRatio };
+        return { ok: false, reason: 'bg-inconsistent', dt: baseDt, bgInlierRatio: bgFit.inlierRatio };
       }
 
       // ---- 相對尺度：消掉全域縮放（對焦呼吸、自車輕微前進）----
@@ -448,7 +504,11 @@ export class OpticalFlow {
 
       return {
         ok: true,
-        dt,
+        dt: baseDt,
+        // 這筆量測涵蓋的時間區間 —— IMU 交叉檢核必須用同一段區間積分陀螺儀，
+        // 否則旋轉角與背景位移對不起來，回歸學到的增益會被系統性拉偏。
+        t0: refTs,
+        t1: ts,
         sRel,
         sigmaRel,
         logSRel: Math.log(sRel),

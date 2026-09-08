@@ -50,6 +50,7 @@ export class Overlay {
     if (debug) {
       this._drawCorridor(hud, vw, vh);
       this._drawHorizon(hud, vw, vh);
+      this._drawEgoRegions(hud, vw, vh);
     }
 
     // 所有 track
@@ -84,6 +85,9 @@ export class Overlay {
       });
     }
 
+    // 剎車燈取樣區（debug）
+    if (debug && hud.target) this._drawLampRois(hud);
+
     // 起步證據進度條
     if (hud.target && hud.departure) this._drawEvidence(hud);
   }
@@ -107,6 +111,15 @@ export class Overlay {
       ctx.fillText(label, x + 4, y - 4);
     }
     ctx.restore();
+  }
+
+  /** 已學到的「自車結構」區域（引擎蓋 / 儀表板 / 反光）—— 這些框永不選為前車 */
+  _drawEgoRegions(hud, vw, vh) {
+    for (const r of hud.egoRegions || []) {
+      this._drawBox({ x: r.x * vw, y: r.y * vh, w: r.w * vw, h: r.h * vh }, {
+        color: 'rgba(148,163,184,0.7)', width: 1.5, dash: [3, 3], label: '自車結構',
+      });
+    }
   }
 
   _drawHorizon(hud, vw, vh) {
@@ -146,6 +159,23 @@ export class Overlay {
     ctx.lineWidth = 1;
     ctx.stroke();
     ctx.restore();
+  }
+
+  /** 剎車燈的兩個取樣區與中央車身參考區 —— 看得見才能判斷 ROI 有沒有對準 */
+  _drawLampRois(hud) {
+    const b = hud.brakeCfg;
+    if (!b) return;
+    const box = hud.target.box;
+    const y0 = box.y + box.h * b.yTop;
+    const hh = box.h * (b.yBottom - b.yTop);
+    const sw = box.w * b.sideFrac;
+    const cw = box.w * b.centerFrac;
+    const on = hud.brakeState === 'on';
+    const col = on ? 'rgba(239,68,68,0.9)' : 'rgba(148,163,184,0.7)';
+    this._drawBox({ x: box.x, y: y0, w: sw, h: hh }, { color: col, width: 1 });
+    this._drawBox({ x: box.x + box.w - sw, y: y0, w: sw, h: hh }, { color: col, width: 1 });
+    this._drawBox({ x: box.x + (box.w - cw) / 2, y: y0, w: cw, h: hh },
+      { color: 'rgba(255,255,255,0.3)', width: 1, dash: [2, 3] });
   }
 
   /** 把「證據累積到哪了」畫成兩條進度條：KF 的 z 與 SPRT 的 LLR */

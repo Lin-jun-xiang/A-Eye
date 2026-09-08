@@ -42,17 +42,25 @@ export class AlertPresenter {
     } else if (kind === 'green') {
       this.beep(660, 0.16, 0.32, 0);
       this.beep(990, 0.24, 0.32, 0.18);
+    } else if (kind === 'release') {
+      // 「前車鬆開剎車」是預告不是事件 —— 刻意做得比正式警示輕：
+      // 單音、音量減半。若做得一樣響，駕駛會分不出「該動了」和「快要該動了」。
+      this.beep(760, 0.10, 0.18, 0);
     }
   }
 
   vibrate(kind) {
     if (!navigator.vibrate) return;
-    navigator.vibrate(kind === 'depart' ? [120, 60, 120, 60, 200] : [200, 80, 200]);
+    const pattern = kind === 'depart' ? [120, 60, 120, 60, 200]
+      : kind === 'release' ? [90]
+      : [200, 80, 200];
+    navigator.vibrate(pattern);
   }
 
   flash(kind) {
     const el = this.flashEl;
     if (!el) return;
+    if (kind === 'release') return;      // 預告不閃全螢幕
     el.className = kind === 'depart' ? 'move-flash active' : 'green-flash active';
     setTimeout(() => { el.className = ''; }, 500);
   }
