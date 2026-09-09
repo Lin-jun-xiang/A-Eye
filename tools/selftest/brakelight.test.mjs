@@ -288,6 +288,38 @@ console.log('=== 第三剎車燈（車頂中央那一顆）===');
 }
 
 console.log('');
+console.log('=== 中央的第三剎車燈不得汙染「車身參考區」 ===');
+// 離線跑機在實車影片上抓到的設計矛盾：「有一對紅燈」的判定用
+// 「燈區紅度 / 中央車身紅度」當對比，而**法規規定第三剎車燈就裝在車後中線**。
+// 實測那台車：左燈 52、右燈 56、中央車身 67 → 對比 0.72 < 門檻 1.35
+// → 判成「沒有一對紅燈」，而第三剎車燈的網格值是 193。
+// 修法：參考區改取「燈帶以下」（第三剎車燈依法在煞車燈之上）。
+{
+  const d = new Uint8ClampedArray(W * H * 4);
+  const put = (x, y, c) => {
+    const i = (y * W + x) * 4;
+    d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = 255;
+  };
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) put(x, y, GREY);
+  // 左右尾燈（在燈帶內）
+  for (let y = Math.round(H * 0.45); y < Math.round(H * 0.75); y++) {
+    for (let x = Math.round(W * 0.04); x < Math.round(W * 0.25); x++) put(x, y, TAIL);
+    for (let x = Math.round(W * 0.75); x < Math.round(W * 0.96); x++) put(x, y, TAIL);
+  }
+  // 中央上方的第三剎車燈：一條橫跨中線的紅色燈條
+  for (let y = Math.round(H * 0.04); y < Math.round(H * 0.12); y++) {
+    for (let x = Math.round(W * 0.38); x < Math.round(W * 0.62); x++) put(x, y, BRAKE);
+  }
+  const st = lampStats(d, W, H, B);
+  const contrast = Math.min(st.left, st.right) / (st.body + 6);
+  console.log(`     左燈 ${st.left.toFixed(0)}　右燈 ${st.right.toFixed(0)}`
+    + `　中央車身 ${st.body.toFixed(0)}（參考區 y ${B.bodyYTop}~${B.bodyYBottom}）`
+    + `　對比 ${contrast.toFixed(2)}`);
+  check('車身參考區沒有吃到中央的第三剎車燈', st.body < 20, `body=${st.body.toFixed(0)}`);
+  check('因此「有一對紅燈」判定成立', contrast >= B.minContrast);
+}
+
+console.log('');
 console.log('=== 鎖錯位置要能自己恢復 ===');
 // 實測踩過的坑：搜尋範圍原本設得太寬（x ±22%），右邊界碰到**右尾燈**，
 // 於是在第三燈還沒亮的時候就把追蹤位置鎖在尾燈上（值 68），
