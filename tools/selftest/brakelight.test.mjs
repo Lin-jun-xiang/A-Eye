@@ -165,6 +165,52 @@ console.log('=== 干擾 4：逆光過曝必須回報 unknown，不能回報「�
 }
 
 console.log('');
+console.log('=== 實車夜間量測的回歸測試（數字取自路測影片，非合成）===');
+// 2026-09-08 夜間路測，前車 SUV 停等紅燈後起步。用修好的量測腳本在真實畫格上
+// 量到的數值（左/右燈）：
+//   剎車燈亮：燈芯亮度 137/120、面積 0.43/0.30、對比 1.80~1.94
+//   剎車燈熄：燈芯亮度  88/ 86、面積 0.12/0.11、對比 3.0~6.9
+// 注意兩件事，這是整個設計的關鍵證據：
+//   1. 亮度只掉到 0.64/0.72 —— 單看亮度永遠達不到 offRatio=0.45（原本的 bug）
+//   2. 對比在熄燈時反而「更高」—— 因為亮燈時光暈把中央參考區也照紅了，
+//      所以 contrast 只能用來判斷「有一對紅燈」，不能用來判斷「剎車燈亮」
+{
+  // 直接組出對應的直方圖：比例 a 的像素在紅度 v，其餘在背景紅度 bg
+  const mkHist = (a, v, bg, n = 4000) => {
+    const h = new Int32Array(32);
+    h[Math.min(31, (v / 8) | 0)] = Math.round(n * a);
+    h[Math.min(31, (bg / 8) | 0)] = n - Math.round(n * a);
+    return h;
+  };
+  const mk = (coreL, coreR, aL, aR, body) => ({
+    left: coreL, right: coreR, body,
+    histL: mkHist(aL, coreL, 8), histR: mkHist(aR, coreR, 8),
+    nL: 4000, nR: 4000,
+    overexposed: 0.02, luma: 62, n: 12000,
+  });
+  const LIT = mk(137, 120, 0.43, 0.30, 61);      // contrast = 120/(61+6) = 1.79
+  const DARK = mk(88, 86, 0.12, 0.11, 12);       // contrast = 86/(12+6) = 4.8
+
+  const det = new BrakeLightDetector(CONFIG);
+  let t = 0;
+  for (; t < 3000; t += 100) det.updateFromStats(LIT, t);
+  check('亮燈時 state=on', det.state === 'on', det.lastDetail);
+  const lit = det.peakL;
+
+  let released = false, at = 0;
+  const tOff = t;
+  for (; t < tOff + 1500; t += 100) {
+    const r = det.updateFromStats(DARK, t);
+    if (r.released && !released) { released = true; at = t - tOff; }
+  }
+  check('熄燈後觸發 released', released, `延遲 ${at}ms（offConfirmMs=${B.offConfirmMs}）`);
+  const ratio = (0.12 * 88) / lit;
+  console.log(`     位準比 熄/亮 = ${ratio.toFixed(2)}（門檻 ${B.offRatio}）`
+    + `；若只看亮度則是 ${(88 / 137).toFixed(2)} → 永遠不會觸發`);
+  check('只看亮度的話會漏掉（證明必須用面積×亮度）', 88 / 137 > B.offRatio);
+}
+
+console.log('');
 console.log('=== 先驗：熄燈給 SPRT 的對數勝算比 ===');
 {
   const det = new BrakeLightDetector(CONFIG);

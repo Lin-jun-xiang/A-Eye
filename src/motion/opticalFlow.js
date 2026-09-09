@@ -21,8 +21,112 @@
 //    把 80 個高度相關的點濃縮成「1 個尺度參數 + 它的標準誤」才是正確的降維。
 //    相對尺度 s_rel = s_fg / s_bg 還順便消掉了全域縮放（對焦呼吸、輕微前進）。
 
-import { madSigma } from '../util/math.js';
+import { median } from '../util/math.js';
 import { CONFIG } from '../config.js';
+
+/**
+ * 擬合相似變換（4 自由度：平移 + 旋轉 + 等向尺度），並回報估計的不確定度。
+ *
+ * 為什麼自己算而不用 OpenCV：
+ *   原本用 `cv.estimateAffinePartial2D`，但**官方 opencv.js 根本沒有編入這個函式**
+ *   （opencv/opencv#20538，只有 6 自由度的 estimateAffine2D）。於是它是 undefined，
+ *   呼叫就丟例外、被 try/catch 吃掉、回傳 null —— 每一次量測都是 fg-fit-fail。
+ *   實車路測的除錯面板證實了這件事：`flow ok 0/225 | fg-fit-fail:41`，
+ *   也就是尺度變化率這條路從 v7 寫出來就沒有運作過一次。
+ *
+ * 而且自己算其實更好：
+ *   1. 4 自由度的相似變換有**閉式最小平方解**（Procrustes），不需要迭代或 RANSAC
+ *   2. 這正是 σ_s 傳播公式假設的估計量；用 6 自由度的仿射會多兩個自由度的雜訊
+ *   3. **決定性**（沒有 RANSAC 的隨機取樣）→ 離線回放評測可重現
+ *   4. 純 JS、不依賴 cv → 可以在 node 裡做單元測試
+ *
+ * 推導：令 q = M·p + t，M = [[a, b], [-b, a]]（a = s·cosθ、b = s·sinθ）。
+ * 對中心化座標最小化 Σ|q − M·p|²，兩個正規方程給出
+ *   a =  Σ(dp·dq) / Σ|dp|²        （內積）
+ *   b = −Σ(dp × dq) / Σ|dp|²      （外積）
+ * 離群點用 MAD 估出的 σ 做硬性剔除後重擬合（IRLS 的簡化版），
+ * 因為前景點已經先過 forward-backward 與「跑出目標框」兩道檢核。
+ *
+ * σ_s 的傳播：尺度是「以質心為原點的徑向縮放」，
+ *   σ_s ≈ σ_residual / (rRms · √n)
+ * 這是最小平方估計的標準誤，不是憑感覺的門檻。
+ */
+export function fitSimilarity(prev, next, cfg) {
+  const n = prev.length / 2;
+  if (n < 4) return null;
+  const keep = new Uint8Array(n).fill(1);
+  let a = 1, b = 0, tx = 0, ty = 0, cx = 0, cy = 0, nIn = n;
+  let resid = [], sigmaResid = 0, rRms = 0;
+
+  for (let iter = 0; iter < 3; iter++) {
+    let px = 0, py = 0, qx = 0, qy = 0;
+    nIn = 0;
+    for (let i = 0; i < n; i++) {
+      if (!keep[i]) continue;
+      px += prev[i * 2]; py += prev[i * 2 + 1];
+      qx += next[i * 2]; qy += next[i * 2 + 1];
+      nIn++;
+    }
+    if (nIn < 4) return null;
+    px /= nIn; py /= nIn; qx /= nIn; qy /= nIn;
+
+    let dot = 0, cross = 0, den = 0, sumR2 = 0;
+    for (let i = 0; i < n; i++) {
+      if (!keep[i]) continue;
+      const dpx = prev[i * 2] - px, dpy = prev[i * 2 + 1] - py;
+      const dqx = next[i * 2] - qx, dqy = next[i * 2 + 1] - qy;
+      dot += dpx * dqx + dpy * dqy;
+      cross += dpx * dqy - dpy * dqx;
+      den += dpx * dpx + dpy * dpy;
+      sumR2 += dpx * dpx + dpy * dpy;
+    }
+    if (!(den > 1e-9)) return null;
+    a = dot / den;
+    b = -cross / den;
+    cx = px; cy = py;
+    tx = qx - (a * px + b * py);
+    ty = qy - (-b * px + a * py);
+    rRms = Math.sqrt(sumR2 / nIn);
+
+    // 殘差 → MAD 尺度 → 剔除離群點（最後一輪不再剔除，直接用來報告）
+    resid = [];
+    for (let i = 0; i < n; i++) {
+      if (!keep[i]) continue;
+      const x = prev[i * 2], y = prev[i * 2 + 1];
+      const ex = a * x + b * y + tx;
+      const ey = -b * x + a * y + ty;
+      resid.push(Math.hypot(next[i * 2] - ex, next[i * 2 + 1] - ey));
+    }
+    // 殘差「大小」是 Rayleigh 分布，不是零均值的常態分布 ——
+    // 直接對大小取 MAD 會低估每軸的 σ 約 2.4 倍，後果有兩個：
+    //   (a) 剔除門檻過嚴 → 好點被大量丟掉 → nIn 不足 → 擬合失敗
+    //   (b) σ_s 低報 → SPRT 過度自信 → 實際誤警率遠高於設定的 α
+    // Rayleigh 的中位數 = 1.1774σ，所以由中位數反推每軸 σ 才是對的。
+    // 再乘上自由度校正 √(n/(n−4))：殘差是「扣掉 4 個已擬合參數之後」的剩餘，
+    // 不校正的話 σ 會系統性低估（n=20 時約低 11%），SPRT 就會偏樂觀。
+    const dof = nIn > 5 ? Math.sqrt(nIn / (nIn - 4)) : 1.5;
+    sigmaResid = Math.max((median(resid) / 1.1774) * dof, 0.05);   // 下限防止除以 0
+    if (iter === 2) break;
+    let dropped = 0, k = 0;
+    for (let i = 0; i < n; i++) {
+      if (!keep[i]) continue;
+      if (resid[k++] > cfg.outlierSigma * sigmaResid) { keep[i] = 0; dropped++; }
+    }
+    if (!dropped) break;
+  }
+
+  const s = Math.hypot(a, b);
+  if (!(s > 0.5 && s < 2.0)) return null;             // 離譜的解，視為擬合失敗
+  const sigmaS = rRms > 1e-3 ? sigmaResid / (rRms * Math.sqrt(nIn)) : Infinity;
+
+  return {
+    a, b, tx, ty, s, theta: Math.atan2(-b, a),
+    sigmaS, sigmaResid, rRms,
+    n, nIn, inlierRatio: nIn / n,
+    centroid: { x: cx, y: cy },
+    apply: (x, y) => ({ x: a * x + b * y + tx, y: -b * x + a * y + ty }),
+  };
+}
 
 /** cv.Mat 生命週期管理：一次 tick 內配置的都登記，結束一律釋放 */
 class MatBag {
@@ -296,65 +400,8 @@ export class OpticalFlow {
     return { prev: Float32Array.from(prev), next: Float32Array.from(next), idx };
   }
 
-  /**
-   * 擬合相似變換（4 自由度：平移 + 旋轉 + 尺度），並回報估計的不確定度。
-   * σ_s 的傳播：尺度是「以質心為原點的徑向縮放」，
-   *   σ_s ≈ σ_residual / (rRms · √n)
-   * 這是最小平方估計的標準誤，不是憑感覺的門檻。
-   */
-  _fitSimilarity(prev, next, bag) {
-    const n = prev.length / 2;
-    if (n < 4) return null;
-    const f = this.cfg.flow;
-    const from = bag.add(cv.matFromArray(n, 1, cv.CV_32FC2, Array.from(prev)));
-    const to = bag.add(cv.matFromArray(n, 1, cv.CV_32FC2, Array.from(next)));
-    const inl = bag.add(new cv.Mat());
-    let M = null;
-    try {
-      M = cv.estimateAffinePartial2D(from, to, inl, cv.RANSAC, f.ransacReprojPx, 2000, 0.99, 10);
-    } catch (e) { return null; }
-    if (!M || M.empty() || M.rows !== 2 || M.cols !== 3) { if (M) M.delete(); return null; }
-    bag.add(M);
-
-    const a = M.doubleAt(0, 0), b = M.doubleAt(0, 1);
-    const tx = M.doubleAt(0, 2), ty = M.doubleAt(1, 2);
-    const s = Math.hypot(a, b);
-    const theta = Math.atan2(-b, a);
-    if (!(s > 0.5 && s < 2.0)) return null;    // 離譜的解，視為擬合失敗
-
-    // inlier 上的殘差與半徑
-    const resid = [];
-    let sumX = 0, sumY = 0, nIn = 0;
-    const hasInl = inl && inl.rows === n;
-    for (let i = 0; i < n; i++) {
-      if (hasInl && inl.data[i] !== 1) continue;
-      sumX += prev[i * 2]; sumY += prev[i * 2 + 1];
-      nIn++;
-    }
-    if (nIn < 4) return null;
-    const cx = sumX / nIn, cy = sumY / nIn;
-    let sumR2 = 0;
-    for (let i = 0; i < n; i++) {
-      if (hasInl && inl.data[i] !== 1) continue;
-      const px = prev[i * 2], py = prev[i * 2 + 1];
-      const ex = a * px + b * py + tx;
-      const ey = -b * px + a * py + ty;
-      resid.push(Math.hypot(next[i * 2] - ex, next[i * 2 + 1] - ey));
-      sumR2 += (px - cx) * (px - cx) + (py - cy) * (py - cy);
-    }
-    const rRms = Math.sqrt(sumR2 / nIn);
-    const sigmaResid = Math.max(madSigma(resid), 0.05);   // 下限防止除以 0
-    const sigmaS = rRms > 1e-3
-      ? sigmaResid / (rRms * Math.sqrt(nIn))
-      : Infinity;
-
-    return {
-      a, b, tx, ty, s, theta,
-      sigmaS, sigmaResid, rRms,
-      n, nIn, inlierRatio: nIn / n,
-      centroid: { x: cx, y: cy },
-      apply: (x, y) => ({ x: a * x + b * y + tx, y: -b * x + a * y + ty }),
-    };
+  _fitSimilarity(prev, next) {
+    return fitSimilarity(prev, next, this.cfg.flow);
   }
 
   /**
@@ -477,8 +524,8 @@ export class OpticalFlow {
       }
       const refTs = this.refTs;
 
-      const fgFit = this._fitSimilarity(this.fgRef, this.fgPts, bag);
-      const bgFit = this._fitSimilarity(this.bgRef, this.bgPts, bag);
+      const fgFit = this._fitSimilarity(this.fgRef, this.fgPts);
+      const bgFit = this._fitSimilarity(this.bgRef, this.bgPts);
       this._resetRef(ts);
 
       if (!fgFit) return { ok: false, reason: 'fg-fit-fail', dt: baseDt };

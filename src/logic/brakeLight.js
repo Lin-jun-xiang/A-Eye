@@ -37,27 +37,50 @@ function redness(r, g, b) {
   return d > 0 ? d : 0;
 }
 
+const BINS = 32, BIN_W = 256 / BINS;
+
 /**
- * 取一個矩形區域內「最紅的前 k 比例」像素的紅度平均。
- * 為什麼不取全區平均：燈只佔 ROI 的一部分，取平均會被周圍車身稀釋，
- * 亮燈與熄燈的差異被壓到雜訊裡。
+ * 掃一個矩形區域，把紅度做成 32 格直方圖。
+ * 用直方圖而不是「收集所有值再排序」有兩個好處：
+ *   1. 不配置陣列、不排序 —— 每 tick 省下數千次比較
+ *   2. 同一次掃描就能導出兩個判定量：燈芯亮度（前 k% 平均）與
+ *      「紅度超過 θ 的面積比」。後者是夜間唯一有效的量，見 config 的量測數據。
  */
-function topKRedness(data, w, x0, x1, y0, y1, kFrac) {
-  const vals = [];
+function roiHist(data, w, x0, x1, y0, y1) {
+  const hist = new Int32Array(BINS);
+  let n = 0;
   for (let y = y0; y < y1; y++) {
     const row = y * w;
     for (let x = x0; x < x1; x++) {
       const i = (row + x) * 4;
-      vals.push(redness(data[i], data[i + 1], data[i + 2]));
+      hist[(redness(data[i], data[i + 1], data[i + 2]) / BIN_W) | 0]++;
+      n++;
     }
   }
-  if (!vals.length) return 0;
-  vals.sort((a, b) => b - a);
-  const k = Math.max(4, Math.round(vals.length * kFrac));
-  const n = Math.min(k, vals.length);
-  let sum = 0;
-  for (let i = 0; i < n; i++) sum += vals[i];
-  return sum / n;
+  return { hist, n };
+}
+
+/** 前 kFrac 比例最紅像素的平均紅度（「燈芯亮度」） */
+export function topKFromHist(hist, n, kFrac) {
+  const k = Math.max(4, Math.round(n * kFrac));
+  let cnt = 0, sum = 0;
+  for (let b = BINS - 1; b >= 0 && cnt < k; b--) {
+    const take = Math.min(hist[b], k - cnt);
+    sum += take * (b * BIN_W + BIN_W / 2);
+    cnt += take;
+  }
+  return cnt ? sum / cnt : 0;
+}
+
+/** 紅度 ≥ θ 的像素佔比（「亮起來的面積」），邊界格做線性內插 */
+export function areaAboveFromHist(hist, n, theta) {
+  if (!n) return 0;
+  const b0 = Math.max(0, Math.min(BINS - 1, Math.floor(theta / BIN_W)));
+  let c = 0;
+  for (let b = BINS - 1; b > b0; b--) c += hist[b];
+  const frac = 1 - (theta - b0 * BIN_W) / BIN_W;
+  c += hist[b0] * Math.max(0, Math.min(1, frac));
+  return c / n;
 }
 
 /**
@@ -75,9 +98,12 @@ export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
   const cw = Math.max(1, Math.round(w * cfg.centerFrac));
   const cx0 = Math.max(0, Math.round((w - cw) / 2));
 
-  const left = topKRedness(data, w, 0, sw, y0, y1, cfg.topKFrac);
-  const right = topKRedness(data, w, w - sw, w, y0, y1, cfg.topKFrac);
-  const body = topKRedness(data, w, cx0, cx0 + cw, y0, y1, cfg.topKFrac);
+  const hl = roiHist(data, w, 0, sw, y0, y1);
+  const hr = roiHist(data, w, w - sw, w, y0, y1);
+  const hb = roiHist(data, w, cx0, cx0 + cw, y0, y1);
+  const left = topKFromHist(hl.hist, hl.n, cfg.topKFrac);
+  const right = topKFromHist(hr.hist, hr.n, cfg.topKFrac);
+  const body = topKFromHist(hb.hist, hb.n, cfg.topKFrac);
 
   // 過曝：三通道都貼頂 → 資訊已經被裁掉，紅度會假性歸零
   let over = 0, tot = 0, luma = 0;
@@ -95,6 +121,9 @@ export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
 
   return {
     left, right, body,
+    // 直方圖交給 BrakeLightDetector 算「面積」—— 門檻 θ 取決於它保存的
+    // 燈芯亮度峰值，那是跨 tick 的狀態，不屬於這個純函式
+    histL: hl.hist, histR: hr.hist, nL: hl.n, nR: hr.n,
     overexposed: tot > 0 ? over / tot : 0,
     luma: nAll > 0 ? luma / nAll : 0,
     n: nAll,
@@ -113,9 +142,10 @@ export class BrakeLightDetector {
 
   reset() {
     this.state = 'unknown';       // 'on' | 'off' | 'unknown'
-    this.everOn = false;          // 是否曾確認過「亮」——沒亮過就談不上「熄」
-    this.peakL = 0;
-    this.peakR = 0;
+    this.everOn = false;          // 是否曾確認過「有一對紅燈」
+    this.coreL = 0; this.coreR = 0;       // 燈芯亮度峰值（決定面積門檻 θ）
+    this.peakL = 0; this.peakR = 0;       // 「亮起來的面積」峰值 ← 判定 on/off 用這個
+    this.areaL = 0; this.areaR = 0;       // 本 tick 的面積
     this.offSince = 0;
     this.lastTs = 0;
     this.releaseTs = -Infinity;   // 最近一次確認「熄滅」的時刻
@@ -175,6 +205,8 @@ export class BrakeLightDetector {
       const decay = Math.pow(0.5, (now - this.lastTs) / b.peakHalfLifeMs);
       this.peakL *= decay;
       this.peakR *= decay;
+      this.coreL *= decay;
+      this.coreR *= decay;
     }
     this.lastTs = now;
 
@@ -194,15 +226,32 @@ export class BrakeLightDetector {
     const contrast = weak / (st.body + 6);
     // (2) 對稱性：兩顆尾燈同亮同熄。方向燈是單側 → 被這一項否決。
     const sym = Math.abs(Math.log((st.left + 1) / (st.right + 1)));
-    // (3) 亮度位準，除以整體亮度 → 自動曝光/增益改變時這個值不動
-    const lvlL = st.left / (st.luma + 16);
-    const lvlR = st.right / (st.luma + 16);
-
     // 「有一對對稱紅燈」≠「剎車燈亮」：
-    //   夜間尾燈本來就亮著，剎車燈是同一燈室變更亮 —— 絕對亮度分不開，
-    //   只有「相對於這顆燈自己的峰值」分得開。所以 present 只用來
+    //   夜間尾燈本來就亮著，剎車燈是同一燈室變更亮。所以 present 只用來
     //   (a) 建立峰值參考 (b) 當作前車選取的正向證據（自車結構永遠不會有）。
     const present = contrast >= b.minContrast && sym <= b.symmetryTol;
+
+    // (3) 位準 = 面積 × 燈芯亮度，物理意義是「這顆燈打進影像的紅光總通量」。
+    //     為什麼不能只用亮度：夜間相機的紅通道在剎車燈與尾燈下都飽和（貼到 255），
+    //     峰值亮度在數學上被裁掉了 —— 實車量測熄/亮只掉到 0.64~0.76，
+    //     永遠達不到 offRatio。
+    //     為什麼不能只用面積：面積會變是因為「更亮 → 光暈更大 → 燈殼被照亮的
+    //     範圍更大」，這對共用同一燈室的車款成立（實車量測 0.22~0.30），
+    //     但若某車款的剎車燈是獨立燈泡、亮度變而面積幾乎不變，面積就失效。
+    //     取乘積 = 對通量積分，兩種情形都涵蓋，而且飽和不會把積分裁掉。
+    //     面積門檻 θ 取「燈芯亮度峰值」的一個比例 → 仍是相對量，非絕對像素值。
+    if (present) {
+      // 燈比史上最亮 → 重新建立基準（θ 變了，舊的位準峰值就沒有可比性）
+      if (st.left > this.coreL * 1.05) { this.coreL = st.left; this.peakL = 0; }
+      if (st.right > this.coreR * 1.05) { this.coreR = st.right; this.peakR = 0; }
+    }
+    const thL = b.areaThetaFrac * Math.max(this.coreL, st.left);
+    const thR = b.areaThetaFrac * Math.max(this.coreR, st.right);
+    this.areaL = areaAboveFromHist(st.histL, st.nL, thL);
+    this.areaR = areaAboveFromHist(st.histR, st.nR, thR);
+    const lvlL = this.areaL * st.left;
+    const lvlR = this.areaR * st.right;
+
     if (present) {
       this.everOn = true;
       if (lvlL > this.peakL) this.peakL = lvlL;
@@ -242,8 +291,10 @@ export class BrakeLightDetector {
 
     if (released) this.releaseTs = now;
 
-    this.lastDetail = `lvl=${lvlL.toFixed(2)}/${lvlR.toFixed(2)}`
-      + ` peak=${this.peakL.toFixed(2)}/${this.peakR.toFixed(2)}`
+    this.lastDetail = `lvl=${lvlL.toFixed(0)}/${lvlR.toFixed(0)}`
+      + ` peak=${this.peakL.toFixed(0)}/${this.peakR.toFixed(0)}`
+      + ` area=${this.areaL.toFixed(2)}/${this.areaR.toFixed(2)}`
+      + ` core=${this.coreL.toFixed(0)}/${this.coreR.toFixed(0)}`
       + ` c=${contrast.toFixed(2)} sym=${sym.toFixed(2)}`
       + ` ${this.state}${this.blinking ? ' BLINK' : ''}${present ? '' : ' no-pair'}`;
 
