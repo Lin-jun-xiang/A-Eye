@@ -4,12 +4,13 @@
 // stale-while-revalidate 很容易讓不同版本的模組混在一起（極難除錯）。
 // 離線時才回退到快取。
 
-const CACHE = 'aeye-v10';
+const CACHE = 'aeye-v11';
 
 const FILES = [
   './',
   './index.html',
   './replay.html',
+  './analyze.html',
   './manifest.json',
   './icon.svg',
   './icon-192.png',
@@ -29,12 +30,15 @@ const FILES = [
   './src/motion/egoMotion.js',
   './src/logic/frontCar.js',
   './src/logic/trafficLight.js',
+  './src/logic/brakeLight.js',
   './src/ui/alerts.js',
   './src/ui/overlay.js',
   './src/ui/hud.js',
+  './src/ui/analysisPanel.js',
   './src/capture/frameSource.js',
   './src/capture/recorder.js',
   './src/tools/replay.js',
+  './src/tools/analyze.js',
 ];
 
 self.addEventListener('install', (e) => {

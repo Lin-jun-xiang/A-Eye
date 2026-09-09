@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>A-Eye 快速影片分析</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px 16px 60px;
+    background: #0d1117; color: #e6edf3;
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { opacity: 0.6; font-size: 13px; margin-bottom: 20px; }
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 16px; margin-bottom: 14px;
+  }
+  label.row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  label.row > span:first-child { flex: 0 0 110px; opacity: 0.7; font-size: 13px; }
+  input[type=file], input[type=number], select {
+    background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 6px; padding: 7px 9px; font: inherit;
+  }
+  input[type=number] { width: 90px; }
+  button {
+    background: #4ade80; color: #052e16; border: 0; border-radius: 8px;
+    padding: 10px 18px; font: 600 14px/1 inherit; cursor: pointer;
+  }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.secondary { background: #30363d; color: #e6edf3; }
+  #bar { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; margin: 12px 0 6px; }
+  #bar > div { height: 100%; width: 0; background: #4ade80; transition: width 0.2s; }
+  #info { font-size: 12px; opacity: 0.7; min-height: 18px; }
+  pre {
+    margin: 0; white-space: pre-wrap; word-break: break-word;
+    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #log { max-height: 180px; overflow-y: auto; opacity: 0.65; font-size: 11px; }
+  #result { font-size: 13px; }
+  .hint { font-size: 12px; opacity: 0.55; margin-top: 6px; }
+  video { width: 100%; max-height: 260px; object-fit: contain; background: #000; border-radius: 8px; }
+  canvas { display: none; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>A-Eye 快速影片分析</h1>
+  <div class="sub">上傳一支行車影片 → 直接列出「第幾秒偵測到什麼」。與 App 使用完全同一份判定 pipeline。</div>
+
+  <div class="card">
+    <label class="row">
+      <span>影片檔</span>
+      <input type="file" id="f-video" accept="video/*">
+    </label>
+    <label class="row">
+      <span>分析區間</span>
+      <input type="number" id="from" value="0" min="0" step="1"> 秒 ~
+      <input type="number" id="to" placeholder="到結尾" min="0" step="1"> 秒
+    </label>
+    <label class="row">
+      <span>播放倍速</span>
+      <select id="rate">
+        <option value="1">1×（取樣最密，品質等同即時模式）</option>
+        <option value="2" selected>2×</option>
+        <option value="4">4×（最快，但每影片秒只處理到幾幀）</option>
+      </select>
+    </label>
+    <label class="row">
+      <span>自車狀態</span>
+      <select id="still">
+        <option value="0" selected>由影片自己判斷（背景尺度變化率）</option>
+        <option value="1">強制假設靜止</option>
+      </select>
+    </label>
+    <div class="hint">
+      每一幀的處理成本（光流 + 推論）是固定的，所以倍速只影響「每影片秒取樣到幾幀」，
+      不影響判定門檻（時鐘用的是影片時間）。報告會印出實際取樣率。
+    </div>
+    <div style="margin-top:14px; display:flex; gap:10px">
+      <button id="run" disabled>開始分析</button>
+      <button id="stop" class="secondary" disabled>中止</button>
+    </div>
+    <div id="bar"><div></div></div>
+    <div id="info"></div>
+  </div>
+
+  <div class="card" id="result-card">
+    <pre id="result">尚未分析。</pre>
+    <div style="margin-top:12px"><button id="copy" class="secondary" disabled>複製報告</button></div>
+  </div>
+
+  <div class="card">
+    <pre id="log"></pre>
+  </div>
+
+  <video id="v" playsinline muted></video>
+  <canvas id="c"></canvas>
+</main>
+
+<script type="module">
+import { QuickAnalyzer, formatReport } from './src/tools/analyze.js';
+
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+const lines = [];
+const log = (s) => {
+  lines.push(s);
+  if (lines.length > 200) lines.shift();
+  logEl.textContent = lines.join('\n');
+  logEl.scrollTop = logEl.scrollHeight;
+};
+
+const an = new QuickAnalyzer({
+  video: $('v'),
+  canvas: $('c'),
+  onLog: log,
+  onProgress: (p, s) => {
+    $('bar').firstElementChild.style.width = (Math.max(0, Math.min(1, p)) * 100).toFixed(1) + '%';
+    if (!s) return;
+    $('info').textContent = `影片 ${s.vt.toFixed(1)}s · 已處理 ${s.frames} 幀`
+      + ` · 偵測 ${s.detects} 次 · 事件 ${s.events} 個 · 耗時 ${s.wall.toFixed(0)}s`;
+  },
+});
+
+$('f-video').addEventListener('change', async () => {
+  const f = $('f-video').files[0];
+  if (!f) return;
+  try {
+    const info = await an.load(f);
+    log(`✅ ${f.name}　${info.vw}x${info.vh}　${info.duration.toFixed(1)}s`);
+    $('to').placeholder = info.duration.toFixed(0);
+    $('run').disabled = false;
+  } catch (e) {
+    log('❌ ' + e.message);
+    $('run').disabled = true;
+  }
+});
+
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
+  $('stop').disabled = false;
+  $('result').textContent = '分析中...';
+  $('copy').disabled = true;
+  try {
+    const to = $('to').value === '' ? Infinity : +$('to').value;
+    const rep = await an.run({
+      playbackRate: +$('rate').value,
+      from: +$('from').value || 0,
+      to,
+      assumeStill: $('still').value === '1',
+    });
+    const text = formatReport(rep);
+    $('result').textContent = text;
+    $('copy').disabled = false;
+    log('✅ 分析完成');
+  } catch (e) {
+    $('result').textContent = '❌ ' + e.message;
+    log('❌ ' + e.message);
+    console.error(e);
+  }
+  $('run').disabled = false;
+  $('stop').disabled = true;
+});
+
+$('stop').addEventListener('click', () => { an.stop(); log('已中止'); });
+
+$('copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText($('result').textContent);
+    log('報告已複製到剪貼簿');
+  } catch (e) { log('複製失敗：' + e.message); }
+});
+</script>
+</body>
+</html>
