@@ -10,6 +10,8 @@ export class FrameSource {
   constructor(videoEl) {
     this.video = videoEl;
     this.stream = null;
+    this.fileUrl = null;
+    this.isFile = false;
     this.running = false;
     this.onFrame = null;
     this._handle = null;
@@ -17,6 +19,8 @@ export class FrameSource {
   }
 
   async startCamera({ width, height }) {
+    if (this.isFile) this.stopFile();      // 從影片模式切回相機
+    this.video.loop = false;
     this.stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: 'environment' },
@@ -35,6 +39,39 @@ export class FrameSource {
       });
     }
     return { vw: this.video.videoWidth, vh: this.video.videoHeight };
+  }
+
+  /**
+   * 用影片檔取代相機。
+   * 為什麼要有這個：實車路測一趟只能驗一次，而同一段影片可以在每次改動後
+   * 重跑 —— 這是把「盲調」變成「可重現」的關鍵。與 replay.html 的差別是
+   * 這裡走的是即時路徑（rVFC、掉幀、真實節拍），看到的就是手機上的行為；
+   * replay.html 走的是逐格 seek 的決定性路徑，用來算客觀指標。
+   */
+  async startFile(file) {
+    this.stopCamera();
+    if (this.fileUrl) URL.revokeObjectURL(this.fileUrl);
+    this.fileUrl = URL.createObjectURL(file);
+    this.video.srcObject = null;
+    this.video.src = this.fileUrl;
+    this.video.loop = true;          // 循環播放，方便反覆看同一個起步瞬間
+    this.video.muted = true;
+    this.isFile = true;
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error('影片載入逾時')), 15000);
+      this.video.onloadedmetadata = () => { clearTimeout(t); res(); };
+      this.video.onerror = () => { clearTimeout(t); rej(new Error('此影片無法解碼（iOS 上 webm 常見）')); };
+    });
+    await this.video.play();
+    return { vw: this.video.videoWidth, vh: this.video.videoHeight };
+  }
+
+  stopFile() {
+    this.isFile = false;
+    this.video.pause();
+    this.video.removeAttribute('src');
+    this.video.load();
+    if (this.fileUrl) { URL.revokeObjectURL(this.fileUrl); this.fileUrl = null; }
   }
 
   stopCamera() {

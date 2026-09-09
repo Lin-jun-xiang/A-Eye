@@ -27,6 +27,8 @@ const recBtn = $('rec-btn');
 const markBtn = $('mark-btn');
 const debugBtn = $('debug-btn');
 const pipBtn = $('pip-btn');
+const fileBtn = $('file-btn');
+const fileInput = $('file-input');
 
 // ---------- 元件 ----------
 const gps = new GpsSensor(CONFIG);
@@ -42,6 +44,9 @@ const recorder = new SessionRecorder({ video, gps, imu });
 
 let running = false;
 let starting = false;
+// 影片模式：用檔案取代相機。實車路測一趟只能驗一次，而同一段影片可以在
+// 每次改動後重跑 —— 這是把「盲調」變成「可重現」的關鍵。
+let fileMode = false;
 let debugMode = false;
 let wakeLock = null;
 let hidden = false;
@@ -167,7 +172,9 @@ function renderBadges(hud, now) {
     return;
   }
 
-  if (hud.ego === EgoState.MOVING) {
+  if (hud.assumeStill) {
+    badges.push({ type: 'idle', text: '📁 影片模式 — 假設自車靜止' });
+  } else if (hud.ego === EgoState.MOVING) {
     badges.push({ type: 'idle', text: `🚙 ${hud.egoLabel} — 靜默中` });
   } else if (hud.ego === EgoState.UNKNOWN) {
     badges.push({ type: 'idle', text: '❓ 自車狀態未知（等待 GPS / IMU）' });
@@ -214,20 +221,33 @@ function renderBadges(hud, now) {
 }
 
 // ---------- 啟停 ----------
-async function start() {
+async function start(videoFile = null) {
   if (starting || running) return;
   starting = true;
+  fileMode = !!videoFile;
   toggleBtn.disabled = true;
   toggleBtn.innerHTML = `${BTN_ICON} 啟動中...`;
   try {
-    setStatus('開啟相機...', true);
-    const dim = await frames.startCamera(CONFIG.camera);
-    vw = dim.vw; vh = dim.vh;
+    let imuOk = false;
+    if (fileMode) {
+      setStatus('載入影片...', true);
+      const dim = await frames.startFile(videoFile);
+      vw = dim.vw; vh = dim.vh;
+      // 影片檔沒有 GPS / IMU，自車是否靜止無從得知。
+      // 若照原本的規則（unknown → 靜默），影片模式會一個警示都不出 ——
+      // 所以這裡明確假設自車靜止，並在畫面上標示出來，不讓它變成隱性行為。
+      pipeline.assumeStill = true;
+    } else {
+      setStatus('開啟相機...', true);
+      const dim = await frames.startCamera(CONFIG.camera);
+      vw = dim.vw; vh = dim.vh;
+      pipeline.assumeStill = false;
 
-    // IMU 必須在使用者手勢的呼叫堆疊裡要求授權（iOS 限制）
-    setStatus('要求動作感測器授權...', true);
-    const imuOk = await imu.start();
-    if (!imuOk) console.warn('[A-Eye] IMU 不可用:', imu.permission);
+      // IMU 必須在使用者手勢的呼叫堆疊裡要求授權（iOS 限制）
+      setStatus('要求動作感測器授權...', true);
+      imuOk = await imu.start();
+      if (!imuOk) console.warn('[A-Eye] IMU 不可用:', imu.permission);
+    }
 
     setStatus('載入偵測模型...', true);
     const info = await detector.init();
@@ -237,7 +257,7 @@ async function start() {
       pipeline.onDetections(boxes, ts);
     };
 
-    gps.start();
+    if (!fileMode) gps.start();
     alerts.ensureAudio();
     await requestWakeLock();
 
@@ -246,13 +266,14 @@ async function start() {
     toggleBtn.disabled = false;
     toggleBtn.innerHTML = `${BTN_ICON} 停止`;
     toggleBtn.className = 'stop';
-    recBtn.style.display = '';
+    recBtn.style.display = fileMode ? 'none' : '';
     pipBtn.style.display = '';
     const camSet = frames.settings();
     setStatus(
       `${info.model} @${info.provider} ${info.inputSize}px`
+      + (fileMode ? ` · 影片 ${vw}x${vh}` : '')
       + (camSet ? ` · ${camSet.width}x${camSet.height}` : '')
-      + (imuOk ? ' · IMU' : ' · 無IMU'),
+      + (fileMode ? '' : (imuOk ? ' · IMU' : ' · 無IMU')),
       true
     );
 
@@ -266,6 +287,9 @@ async function start() {
   } catch (e) {
     starting = false;
     running = false;
+    // 影片載入失敗時要收乾淨，否則 blob URL 會留著、下一次啟動狀態也不對
+    if (fileMode) { frames.stopFile(); fileMode = false; }
+    pipeline.assumeStill = false;
     toggleBtn.disabled = false;
     toggleBtn.innerHTML = `${BTN_ICON} 開始偵測`;
     toggleBtn.className = 'start';
@@ -286,7 +310,9 @@ async function stop() {
   running = false;
   frames.stop();
   if (recorder.recording) await recorder.stop();
-  frames.stopCamera();
+  if (fileMode) frames.stopFile(); else frames.stopCamera();
+  fileMode = false;
+  pipeline.assumeStill = false;
   gps.stop();
   imu.stop();
   detector.dispose();
@@ -314,6 +340,15 @@ async function requestWakeLock() {
 
 // ---------- 按鈕 ----------
 toggleBtn.addEventListener('click', () => { running ? stop() : start(); });
+
+fileBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async () => {
+  const f = fileInput.files && fileInput.files[0];
+  fileInput.value = '';                  // 允許重選同一個檔案
+  if (!f) return;
+  if (running) await stop();
+  await start(f);
+});
 
 debugBtn.addEventListener('click', () => {
   debugMode = !debugMode;

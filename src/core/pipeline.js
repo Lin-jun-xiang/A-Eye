@@ -37,6 +37,9 @@ export class Pipeline {
 
     this.enableCarDepart = true;
     this.enableTrafficLight = true;
+    // 影片模式：檔案沒有 GPS / IMU，自車是否靜止無從得知。
+    // 這是一個「明確宣告的假設」而不是靜默的行為改變 —— hud 會把它傳給 UI 顯示。
+    this.assumeStill = false;
 
     this.lastFlow = null;
     this.lastFlowTs = 0;
@@ -47,7 +50,8 @@ export class Pipeline {
     // 「觀察夠久卻始終沒有一對對稱的紅燈」是自車結構/反光的正向反證。
     this.lampEvidence = new Map();
     this.lastTickTs = 0;
-    this.visBgResid = null;
+    // 給 egoMotion 的視覺證據（上一個 tick 算出來的，因為 ego 判定在光流之前）
+    this.visEvidence = null;
     this.imuDisagree = 0;
     this.trusted = true;
     this.target = null;
@@ -71,7 +75,7 @@ export class Pipeline {
     this.lastFlow = null;
     this.lastFlowTs = 0;
     this.lastTickTs = 0;
-    this.visBgResid = null;
+    this.visEvidence = null;
     this.target = null;
     this.stats = { ticks: 0, flowOk: 0, flowFail: {}, detections: 0 };
   }
@@ -119,8 +123,8 @@ export class Pipeline {
     }
 
     // ---- 2) 自車運動（三路融合）----
-    this.ego.update(now, this.visBgResid);
-    const canAlert = this.ego.canAlert;
+    this.ego.update(now, this.visEvidence);
+    const canAlert = this.ego.canAlert || this.assumeStill;
 
     // ---- 3) 目標選取 ----
     const vehTracks = this.tracker.confirmedOf(cfg.vehicleClasses, now);
@@ -222,6 +226,7 @@ export class Pipeline {
         egoSource: this.ego.source,
         egoLabel: this.ego.label,
         canAlert,
+        assumeStill: this.assumeStill,
         speed: this.ego.speed,
         target: target ? { id: target.id, box: target.boxAt(now), score: target.score } : null,
         tracks: this.tracker.tracks.map((t) => ({
@@ -268,7 +273,18 @@ export class Pipeline {
   _crossCheckImu(flowRes, prevTs, now) {
     this.trusted = true;
     this.imuDisagree = 0;
-    this.visBgResid = null;
+
+    // ---- 背景尺度變化率 → 自車是否在前進 ----
+    // 自車前進 → 背景（路面、建物、旁車）逼近 → 背景尺度 > 1。
+    // 這是判斷「自車有沒有在動」最直接的視覺證據，而且**旋轉不改變尺度**，
+    // 所以它對手機晃動天然免疫（位移殘差那一路不是）。
+    // 用途：否決 GPS 的靜止漂移（實測停在路口時 GPS 常跳 2~5 km/h）。
+    const bg = flowRes.bg;
+    const bgExpZ = (bg && bg.sigmaS > 0 && isFinite(bg.sigmaS))
+      ? Math.log(bg.s) * bg.s / bg.sigmaS
+      : null;
+    this.visEvidence = { resid: null, bgExpZ };
+
     if (!this.imu || !this.imu.hasGyro) return;
 
     const rot = this.imu.integrateRotation(prevTs, now);
@@ -285,7 +301,7 @@ export class Pipeline {
         if (this.imuDisagree > this.cfg.imu.disagreeSigma) this.trusted = false;
       }
       // 扣掉旋轉後的平移殘差（換回影像 px）→ 自車平移的視覺證據
-      this.visBgResid = residMag / Math.max(flowRes.roi.scale, 1e-3);
+      this.visEvidence.resid = residMag / Math.max(flowRes.roi.scale, 1e-3);
     }
 
     // 學習永遠要做（包含尚未校準完成時）
@@ -338,6 +354,9 @@ export class Pipeline {
           + ` sRel=${f.sRel.toFixed(5)}±${f.sigmaRel.toExponential(1)} dy=${f.dyRel.toFixed(2)}`
         : `flow FAIL: ${f.reason}`);
     }
+    const bz = this.visEvidence && this.visEvidence.bgExpZ;
+    l.push(`bgExpZ=${bz === null || bz === undefined ? '--' : bz.toFixed(1)}`
+      + `（|z|<${this.cfg.ego.visualStaticZ} → 自車視覺上靜止）`);
     l.push(`imu cal=${this.imu?.calibrated ? 'Y' : 'N'} q=${(this.imu?.calibX.quality || 0).toFixed(2)}`
       + ` disagree=${this.imuDisagree.toFixed(1)}σ trusted=${this.trusted ? 'Y' : 'N'}`);
     l.push(this.light.debugLine());

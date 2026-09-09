@@ -76,6 +76,11 @@ code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 12p
     <div>
       <label>回放取樣率 (Hz)</label>
       <input type="number" id="hz" value="15" min="2" max="30">
+    </label>
+    <label style="display:flex;align-items:center;gap:6px">
+      <input type="checkbox" id="assume-still" checked>
+      <span>假設自車靜止（沒有 sensors.jsonl 時必須勾，否則 ego 狀態是
+        <code>unknown</code> → 一個事件都不會觸發）</span>
     </div>
     <div style="flex:0 0 auto">
       <button id="run" disabled>開始評測</button>
@@ -144,6 +149,7 @@ async function tryLoad() {
     log(`✅ 影片 ${info.vw}x${info.vh}, ${info.duration.toFixed(1)}s`);
     log(`   感測器 ${info.sensorRows} 筆、ground truth 標註 ${info.marks} 筆`);
     if (info.marks === 0) log('   ⚠ 無標註 → 所有警示都會被算成誤警（適合用來測「靜止對照組」）');
+    if (info.sensorRows === 0) log('   ⚠ 無感測器 log → 請保持「假設自車靜止」勾選');
     loaded = true;
     $('run').disabled = false;
   } catch (e) {
@@ -156,7 +162,12 @@ $('run').addEventListener('click', async () => {
   $('run').disabled = true;
   $('stop').disabled = false;
   try {
-    const rep = await runner.run({ hz: +$('hz').value });
+    const rep = await runner.run({
+      hz: +$('hz').value,
+      // 影片檔沒有 GPS / IMU → ego 狀態是 unknown。預設規則是「unknown 就靜默」，
+      // 所以不覆寫的話評測結果永遠是 0 事件。
+      cfgOverride: $('assume-still').checked ? { ego: { unknownIsStill: true } } : null,
+    });
     if (rep) render(rep);
   } catch (e) {
     log('❌ ' + e.message + '\n' + e.stack);

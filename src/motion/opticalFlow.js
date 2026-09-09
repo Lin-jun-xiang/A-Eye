@@ -561,7 +561,10 @@ export class OpticalFlow {
         logSRel: Math.log(sRel),
         dxRel, dyRel,
         fg: { n: fgFit.n, nIn: fgFit.nIn, s: fgFit.s, sigmaS: fgFit.sigmaS, resid: fgFit.sigmaResid, rRms: fgFit.rRms },
-        bg: { n: bgFit.n, nIn: bgFit.nIn, s: bgFit.s, inlierRatio: bgFit.inlierRatio, resid: bgFit.sigmaResid },
+        bg: {
+          n: bgFit.n, nIn: bgFit.nIn, s: bgFit.s, sigmaS: bgFit.sigmaS,
+          inlierRatio: bgFit.inlierRatio, resid: bgFit.sigmaResid,
+        },
         // 給 IMU 校準用的背景觀測（ROI 座標）
         bgObs: { dx: bgFit.tx, dy: bgFit.ty, dtheta: bgFit.theta },
         roi: { ...this.anchor, scale: this.roiScale, w: this.roiW, h: this.roiH },
