@@ -146,6 +146,7 @@ export class BrakeLightDetector {
     this.coreL = 0; this.coreR = 0;       // 燈芯亮度峰值（決定面積門檻 θ）
     this.peakL = 0; this.peakR = 0;       // 「亮起來的面積」峰值 ← 判定 on/off 用這個
     this.areaL = 0; this.areaR = 0;       // 本 tick 的面積
+    this.levelL = 0; this.levelR = 0;     // 本 tick 的位準（面積×亮度）
     this.offSince = 0;
     this.lastTs = 0;
     this.releaseTs = -Infinity;   // 最近一次確認「熄滅」的時刻
@@ -251,6 +252,9 @@ export class BrakeLightDetector {
     this.areaR = areaAboveFromHist(st.histR, st.nR, thR);
     const lvlL = this.areaL * st.left;
     const lvlR = this.areaR * st.right;
+    // 存起來給 UI —— 分析頻率低於畫面幀率，UI 不能只在有量測的那一幀才有值，
+    // 否則面板會在「數值」與「--」之間跳（又是一種閃爍）
+    this.levelL = lvlL; this.levelR = lvlR;
 
     if (present) {
       this.everOn = true;

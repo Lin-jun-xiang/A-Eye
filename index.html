@@ -69,6 +69,11 @@ body {
   display: flex; flex-direction: column;
 }
 #camera { flex: 1; width: 100%; object-fit: cover; background: #111; }
+/* 影片模式用 contain：手機直式影片放到桌機橫向視窗時，cover 的縮放倍率是
+   max(vw寬比, vh高比)，會把畫面放大到只看得見中間一小條。
+   檢視錄影要看到完整畫面，所以改成 contain 並讓兩側留黑邊。
+   Overlay 的座標映射必須跟著切換（overlay.js 的 fit），否則框會畫錯位置。 */
+#camera.contain { object-fit: contain; }
 
 #status-bar {
   position: absolute; top: 0; left: 0; right: 0;
@@ -133,6 +138,28 @@ body {
 
 #overlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 5; }
 
+/* 影片分析面板：只在影片模式出現。位置固定、不吃觸控、行高固定，
+   所以數值變動不會造成重排（重排就是閃爍的來源）。 */
+#analysis-panel {
+  display: none;
+  position: absolute; top: 52px; right: 10px;
+  width: min(340px, calc(100vw - 20px));
+  max-height: calc(100dvh - 260px); overflow-y: auto;
+  padding: 10px 12px; border-radius: 10px;
+  background: rgba(8,10,14,0.82); border: 1px solid rgba(255,255,255,0.12);
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  z-index: 9; pointer-events: none;
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+}
+#analysis-panel .ap-row { display: flex; gap: 8px; }
+#analysis-panel .ap-key { flex: 0 0 76px; opacity: 0.55; }
+#analysis-panel .ap-val { flex: 1; word-break: break-word; }
+#analysis-panel .ap-sep {
+  margin: 8px 0 4px; padding-top: 6px; opacity: 0.55;
+  border-top: 1px solid rgba(255,255,255,0.12);
+}
+#analysis-panel .ap-log { white-space: pre-wrap; opacity: 0.9; }
+
 #debug-panel {
   position: absolute; top: 44px; left: 8px; right: 8px;
   max-height: 42dvh; overflow: auto;
@@ -168,6 +195,7 @@ body {
 
 <video id="camera" autoplay playsinline muted></video>
 <canvas id="overlay"></canvas>
+<div id="analysis-panel"></div>
 <pre id="debug-panel"></pre>
 
 <div id="status-bar">

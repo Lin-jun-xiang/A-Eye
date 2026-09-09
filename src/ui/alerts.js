@@ -73,8 +73,14 @@ export class AlertPresenter {
 
   render(badges) {
     if (!this.alertsEl) return;
-    this.alertsEl.innerHTML = badges.map(
+    const html = badges.map(
       (b) => `<div class="alert-badge ${b.type}">${b.text}</div>`
     ).join('');
+    // 內容沒變就不寫 DOM。重建 innerHTML 會讓瀏覽器丟掉整棵子樹再重排，
+    // 這才是「徽章一直閃、讀不出字」的直接來源 —— 呼叫端限流還不夠，
+    // 因為即使限到 5Hz，每次都重建 DOM 一樣會閃。
+    if (html === this._lastHtml) return;
+    this._lastHtml = html;
+    this.alertsEl.innerHTML = html;
   }
 }

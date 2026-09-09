@@ -12,9 +12,12 @@ export class Overlay {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.video = video;
+    // 必須與 CSS 的 object-fit 一致，否則框會畫錯位置。
+    // 相機模式用 cover（全螢幕取景），影片模式用 contain（要看到完整畫面）。
+    this.fit = 'cover';
   }
 
-  /** 把 canvas 對齊到 video 的實際顯示區域（object-fit: cover） */
+  /** 把 canvas 對齊到 video 的實際顯示區域 */
   syncSize(vw, vh) {
     const rect = this.video.getBoundingClientRect();
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -26,8 +29,10 @@ export class Overlay {
     this.canvas.style.width = w + 'px';
     this.canvas.style.height = h + 'px';
 
-    // object-fit: cover → 等比縮放後裁切
-    const scale = Math.max(w / vw, h / vh);
+    // cover = 等比縮放後裁切（取 max）；contain = 完整塞進去、留黑邊（取 min）
+    const scale = this.fit === 'contain'
+      ? Math.min(w / vw, h / vh)
+      : Math.max(w / vw, h / vh);
     this.map = {
       scale: scale * dpr,
       dx: (w - vw * scale) / 2 * dpr,

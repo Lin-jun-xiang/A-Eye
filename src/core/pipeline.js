@@ -246,6 +246,11 @@ export class Pipeline {
         brakePrimed: this.brake.primed(now),
         brakeDetail: this.brake.lastDetail,
         brakeCfg: cfg.brakeLight,
+        // 判定「熄滅」靠的是「位準 / 峰值」這個比值，所以峰值與門檻要一起給 UI
+        brakePeak: Math.min(this.brake.peakL, this.brake.peakR),
+        brakeLevel: Math.min(this.brake.levelL, this.brake.levelR),
+        brakeBlinking: this.brake.blinking,
+        brakeOffRatio: cfg.brakeLight.offRatio,
         flow: flowRes,
         lastFlow: this.lastFlow,
         light: lightInfo,

@@ -15,6 +15,7 @@ import { SessionRecorder } from './capture/recorder.js';
 import { AlertPresenter } from './ui/alerts.js';
 import { Overlay } from './ui/overlay.js';
 import { Metrics, DebugPanel } from './ui/hud.js';
+import { AnalysisPanel } from './ui/analysisPanel.js';
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
@@ -40,6 +41,7 @@ const alerts = new AlertPresenter({ alertsEl: $('alerts'), flashEl: $('flash-ove
 const overlay = new Overlay($('overlay'), video);
 const metrics = new Metrics();
 const debugPanel = new DebugPanel($('debug-panel'));
+const analysis = new AnalysisPanel($('analysis-panel'));
 const recorder = new SessionRecorder({ video, gps, imu });
 
 let running = false;
@@ -55,6 +57,12 @@ let vw = 0, vh = 0;
 let lastEventText = '';
 let lastEventKind = '';
 let lastEventTs = 0;
+// 徽章穩定化：原本每一幀（30Hz）重建 innerHTML，加上數值本身在跳，
+// 結果就是整片閃爍到讀不出來。三道處理：限流、內容沒變就不寫 DOM、
+// 以及「剎車燈狀態」要維持最短顯示時間。
+let lastBadgeHtml = '';
+let lastBadgeTs = 0;
+let shownBrake = { state: 'unknown', since: 0, pending: null, pendingSince: 0 };
 const eventLog = [];
 
 const BTN_ICON = '<svg class="btn-icon"><use href="#logo"/></svg>';
@@ -127,7 +135,10 @@ function onFrame(now) {
     lastEventText = ev.text;
     lastEventKind = ev.kind;
     lastEventTs = now;
-    eventLog.push({ t: Math.round(now), kind: ev.kind });
+    eventLog.push({ t: Math.round(now), kind: ev.kind, vt: video.currentTime });
+    // 影片模式：事件累積成時間軸。「有沒有在正確的時間點觸發」這個問題，
+    // 一閃即逝的徽章答不了。
+    if (fileMode) analysis.addEvent(video.currentTime || 0, ev.kind, ev.text);
     if (CONFIG.debug.logEvents) {
       console.log(`[A-Eye] ${ev.text}`, pipeline.departure.debugLine());
     }
@@ -139,6 +150,9 @@ function onFrame(now) {
   metrics.drawMs.push(performance.now() - t2);
 
   renderBadges(hud, now);
+  if (fileMode) {
+    analysis.render(now, hud, video.currentTime || 0, video.duration || 0, detector);
+  }
   debugPanel.render(now, metrics, pipeline, detector, [
     `cam ${vw}x${vh}`,
     `events ${eventLog.length}`,
@@ -155,7 +169,26 @@ function onFrame(now) {
   }
 }
 
+/**
+ * 剎車燈狀態的顯示用穩定化：底層狀態在對比邊界上會短暫跳成 unknown，
+ * 直接顯示就會閃。要求新狀態持續 400ms 才換 —— 這只影響「顯示」，
+ * 判定本身不受影響（判定有自己的 offConfirmMs）。
+ */
+function stableBrake(state, now) {
+  if (state === shownBrake.state) { shownBrake.pending = null; return state; }
+  if (shownBrake.pending !== state) { shownBrake.pending = state; shownBrake.pendingSince = now; }
+  if (now - shownBrake.pendingSince >= 400) {
+    shownBrake.state = state;
+    shownBrake.since = now;
+    shownBrake.pending = null;
+  }
+  return shownBrake.state;
+}
+
 function renderBadges(hud, now) {
+  // 限流：徽章是給「掃一眼」用的，30Hz 更新沒有任何意義，只會閃
+  if (now - lastBadgeTs < 200) return;
+  lastBadgeTs = now;
   const badges = [];
 
   // 剛觸發的事件停留 3 秒（「鬆剎車」只留 1.5 秒，它只是預告）
@@ -180,6 +213,14 @@ function renderBadges(hud, now) {
     badges.push({ type: 'idle', text: '❓ 自車狀態未知（等待 GPS / IMU）' });
   }
 
+  // 影片模式：詳細資訊都在分析面板裡，底部只留「事件」與「模式」兩條。
+  // 兩邊都顯示只會互相重疊，而且同一份資訊出現兩次反而更難讀。
+  if (fileMode) {
+    if (badges.length === 0) badges.push({ type: 'idle', text: '📁 分析中...' });
+    alerts.render(badges);
+    return;
+  }
+
   if (pipeline.enableCarDepart) {
     // 光流還沒載好不代表什麼都不能做 —— 剎車燈快路徑不需要 OpenCV，
     // 所以這條只是資訊，不再取代下面的追蹤徽章
@@ -191,15 +232,14 @@ function renderBadges(hud, now) {
     } else {
       const d = hud.departure;
       const ttc = isFinite(d.ttc) && d.ttc < 999 ? ` TTC ${d.ttc.toFixed(0)}s` : '';
-      const pct = Math.round(100 * Math.max(
-        Math.min(d.z / d.zFire, 1), 0
-      ));
+      // 量化到 5% 一格：逐幀的小數變動對「還差多少」的判讀沒有幫助，只會閃
+      const pct = Math.round(20 * Math.max(Math.min(d.z / d.zFire, 1), 0)) * 5;
       badges.push({
         type: 'idle',
         // 把「為什麼還沒報」直接寫在畫面上 —— 實車測試時手機沒有 console，
         // 只看得到證據百分比的話，完全無法區分「訊號不足」和「某道閘門卡住」。
         text: `🚗 追蹤前車 #${hud.target.id}｜證據 ${pct}%${ttc}｜${d.reason}`
-          + `｜剎車燈 ${BRAKE_LABEL[hud.brakeState] || '?'}`
+          + `｜剎車燈 ${BRAKE_LABEL[stableBrake(hud.brakeState, now)] || '?'}`
           + (hud.brakePrimed ? '⚡已預備' : '')
           + (hud.trusted ? '' : '｜⚠背景不可信'),
       });
@@ -237,11 +277,16 @@ async function start(videoFile = null) {
       // 若照原本的規則（unknown → 靜默），影片模式會一個警示都不出 ——
       // 所以這裡明確假設自車靜止，並在畫面上標示出來，不讓它變成隱性行為。
       pipeline.assumeStill = true;
+      // 顯示方式與 overlay 的座標映射必須一起切換
+      video.classList.add('contain');
+      overlay.fit = 'contain';
     } else {
       setStatus('開啟相機...', true);
       const dim = await frames.startCamera(CONFIG.camera);
       vw = dim.vw; vh = dim.vh;
       pipeline.assumeStill = false;
+      video.classList.remove('contain');
+      overlay.fit = 'cover';
 
       // IMU 必須在使用者手勢的呼叫堆疊裡要求授權（iOS 限制）
       setStatus('要求動作感測器授權...', true);
@@ -268,6 +313,7 @@ async function start(videoFile = null) {
     toggleBtn.className = 'stop';
     recBtn.style.display = fileMode ? 'none' : '';
     pipBtn.style.display = '';
+    analysis.setVisible(fileMode);
     const camSet = frames.settings();
     setStatus(
       `${info.model} @${info.provider} ${info.inputSize}px`
@@ -290,6 +336,9 @@ async function start(videoFile = null) {
     // 影片載入失敗時要收乾淨，否則 blob URL 會留著、下一次啟動狀態也不對
     if (fileMode) { frames.stopFile(); fileMode = false; }
     pipeline.assumeStill = false;
+    video.classList.remove('contain');
+    overlay.fit = 'cover';
+    analysis.setVisible(false);
     toggleBtn.disabled = false;
     toggleBtn.innerHTML = `${BTN_ICON} 開始偵測`;
     toggleBtn.className = 'start';
@@ -313,6 +362,9 @@ async function stop() {
   if (fileMode) frames.stopFile(); else frames.stopCamera();
   fileMode = false;
   pipeline.assumeStill = false;
+  video.classList.remove('contain');
+  overlay.fit = 'cover';
+  analysis.setVisible(false);
   gps.stop();
   imu.stop();
   detector.dispose();
