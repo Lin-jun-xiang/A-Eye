@@ -124,9 +124,54 @@ export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
     // 直方圖交給 BrakeLightDetector 算「面積」—— 門檻 θ 取決於它保存的
     // 燈芯亮度峰值，那是跨 tick 的狀態，不屬於這個純函式
     histL: hl.hist, histR: hr.hist, nL: hl.n, nR: hr.n,
+    chGrid: chmslGrid(data, w, h, cfg),
     overexposed: tot > 0 ? over / tot : 0,
     luma: nAll > 0 ? luma / nAll : 0,
     n: nAll,
+  };
+}
+
+/**
+ * 第三剎車燈的搜尋網格：中央上部切成 cols×rows 格，每格取「最大紅度」。
+ *
+ * 取最大而不是平均：這顆燈很小（實測在 bbox 寬的 x 0.44~0.56、高的 y 0~0.10，
+ * 佔整個 bbox 不到 2%），取平均會被周圍的暗車身稀釋掉。
+ *
+ * 搜尋範圍由法規決定而不是猜的：「應裝置於車後中線且其基準中心應高於
+ * 煞車燈基準中心」→ 中央、上半部。
+ *
+ * 回傳的是原始網格，判定留給 BrakeLightDetector —— 因為那需要跨 tick 的
+ * 位置追蹤與峰值/谷值，不屬於純函式。
+ */
+export function chmslGrid(data, w, h, cfg = CONFIG.brakeLight) {
+  const c = cfg.chmsl;
+  const x0 = Math.max(0, Math.round(w * (0.5 - c.searchXFrac / 2)));
+  const x1 = Math.min(w, Math.round(w * (0.5 + c.searchXFrac / 2)));
+  const y1 = Math.min(h, Math.max(2, Math.round(h * c.searchYFrac)));
+  const vals = new Float32Array(c.cols * c.rows);
+  for (let ry = 0; ry < c.rows; ry++) {
+    const cy0 = Math.round(y1 * ry / c.rows), cy1 = Math.round(y1 * (ry + 1) / c.rows);
+    for (let rx = 0; rx < c.cols; rx++) {
+      const cx0 = x0 + Math.round((x1 - x0) * rx / c.cols);
+      const cx1 = x0 + Math.round((x1 - x0) * (rx + 1) / c.cols);
+      let mx = 0;
+      for (let y = cy0; y < cy1; y++) {
+        const row = y * w;
+        for (let x = cx0; x < cx1; x++) {
+          const i = (row + x) * 4;
+          const v = redness(data[i], data[i + 1], data[i + 2]);
+          if (v > mx) mx = v;
+        }
+      }
+      vals[ry * c.cols + rx] = mx;
+    }
+  }
+  // 每格中心的正規化座標（0~1，相對整個 bbox）——位置追蹤要用
+  return {
+    vals, cols: c.cols, rows: c.rows,
+    cellW: (x1 - x0) / c.cols / w,
+    cellH: y1 / c.rows / h,
+    xOff: x0 / w,
   };
 }
 
@@ -163,6 +208,18 @@ export class BrakeLightDetector {
     this.offEdges = [];           // 近期 on→off 的時刻（判斷雙閃/方向燈用）
     this.blinking = false;
     this.resolved = false;   // 動態範圍是否已足以區分尾燈與剎車燈
+
+    // ---- 第三剎車燈（車頂中央那一顆）----
+    this.chPos = null;            // 追蹤到的位置（bbox 內的正規化座標）
+    this.chPeak = 0;              // 這顆燈自己的亮度峰值
+    this.chFloor = Infinity;      // 與谷值 —— 兩者的比值決定「能不能信」
+    this.chVal = 0;
+    this.chState = 'unknown';     // 'on' | 'off' | 'unknown'
+    this.chPendingState = null;
+    this.chPendingSince = 0;
+    this.chPressTs = -Infinity;   // 最近一次「踩下」（起步前兆，領先約 9 秒）
+    this.chUsable = false;        // 這台車看不看得到第三剎車燈
+    this.chFar = false;           // 車太遠 → 暫時不用這條判據
     this.lastDetail = 'idle';
     this.lastStats = null;
   }
@@ -170,6 +227,129 @@ export class BrakeLightDetector {
   /** 是否處於「已預備」狀態（剎車燈剛熄，起步很可能馬上發生） */
   primed(now) {
     return now - this.releaseTs <= this.cfg.brakeLight.priorValidMs;
+  }
+
+  /** 前車踩下剎車後尚在有效期內（自排打檔必須踩剎車 → 起步前兆，領先約 9 秒） */
+  pressed(now) {
+    return now - this.chPressTs <= this.cfg.brakeLight.chmsl.pressValidMs;
+  }
+
+  /**
+   * 第三剎車燈判定。
+   *
+   * 兩個關鍵設計，都是被實測資料逼出來的：
+   *
+   * 1. **不跟空間鄰居比，跟這顆燈自己的過去比。**
+   *    原本想用「中央格 / 左右鄰居」的空間對比做無狀態判定，看起來很乾淨。
+   *    但 84 幀的實測顯示它直接重疊：燈的紅度在相鄰兩幀是 142 → 143（沒變），
+   *    鄰居卻從 74 跳到 178，比值因此從 1.9 掉到 0.8 —— 判定翻面。
+   *    原因是 YOLO 的框每幀都在抖（266×262 → 283×267），
+   *    「bbox 上緣 12.5%」這條帶會蓋到車身的不同位置。
+   *    **任何以 bbox 固定比例當基準的空間參考都會被框的抖動害死**
+   *    （這是同一個坑的第二次：第一次是外側燈的 yTop=0.38 量到了保險桿反光片）。
+   *
+   * 2. **位置要追蹤。** 燈在車上是固定的，所以位置的穩定性本身就是一道驗證。
+   *    只有在「明顯是一顆燈」（紅度遠高於網格中位數）時才更新追蹤位置，
+   *    之後一律讀「追蹤位置上的值」而不是「網格最大值」——
+   *    否則背景其他車的紅燈飄進搜尋區就會被誤認。
+   */
+  _updateChmsl(st, now, boxW) {
+    const c = this.cfg.brakeLight.chmsl;
+    const g = st.chGrid;
+    const out = { usable: false, state: 'unknown', pressed: false, released: false, val: 0 };
+    if (!g) return out;
+
+    // 車太遠 → 這顆燈只剩幾個像素，搜尋區還會吃到背景。實測 84 幀裡
+    // 唯一判錯的就是車駛遠之後的那一幀。
+    if (boxW && boxW < c.minBoxW) {
+      this.chFar = true;
+      return out;
+    }
+    this.chFar = false;
+
+    // ---- 找候選格 ----
+    let mi = 0, mv = -1;
+    for (let i = 0; i < g.vals.length; i++) if (g.vals[i] > mv) { mv = g.vals[i]; mi = i; }
+    const sorted = Array.from(g.vals).sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)];
+    const posOf = (idx) => ({
+      x: g.xOff + (idx % g.cols + 0.5) * g.cellW,
+      y: ((idx / g.cols) | 0) + 0.5,
+    });
+    const cand = posOf(mi);
+    cand.y *= g.cellH;
+
+    // 「這是一顆燈」而不是車身：紅度要遠高於網格中位數，且有絕對下限。
+    // 這一關只管「要不要更新追蹤位置」，寧嚴勿寬 —— 鎖錯位置的代價很高。
+    const looksLit = mv >= Math.max(c.litVsGrid * med, c.litMin);
+
+    // 追蹤位置上的目前值
+    const readAt = (pos) => {
+      const rx = Math.min(g.cols - 1, Math.max(0,
+        Math.round((pos.x - g.xOff) / g.cellW - 0.5)));
+      const ry = Math.min(g.rows - 1, Math.max(0,
+        Math.round(pos.y / g.cellH - 0.5)));
+      return g.vals[ry * g.cols + rx];
+    };
+
+    // ---- 位置追蹤 ----
+    if (looksLit) {
+      if (!this.chPos) {
+        this.chPos = { x: cand.x, y: cand.y };
+      } else if (Math.abs(cand.x - this.chPos.x) <= c.posTol) {
+        // 就在追蹤位置附近 → 微調（燈在車上不動，位置本身就是一道驗證）
+        this.chPos.x = 0.8 * this.chPos.x + 0.2 * cand.x;
+        this.chPos.y = 0.8 * this.chPos.y + 0.2 * cand.y;
+      } else if (mv >= c.relockRatio * Math.max(readAt(this.chPos), 1)) {
+        // 別處出現明顯更強的候選 → 重新鎖定。
+        // 這是唯一的恢復路徑：實測曾在第三燈還沒亮時把位置鎖到尾燈上，
+        // 之後真正的燈亮起也讀不到，因為它離追蹤位置太遠。
+        this.chPos = { x: cand.x, y: cand.y };
+        this.chPeak = 0;
+        this.chFloor = Infinity;
+        this.chState = 'unknown';
+      }
+    }
+
+    // ---- 一律讀「追蹤位置上的值」，不是網格最大值 ----
+    const val = this.chPos ? readAt(this.chPos) : mv;
+    out.val = val;
+    this.chVal = val;
+
+    // ---- 這顆燈自己的峰值/谷值 ----
+    if (looksLit && val > this.chPeak) this.chPeak = val;
+    if (val < this.chFloor) this.chFloor = val;
+    // 寫成不等式，這樣 floor = 0（完全熄滅）自然代表範圍無限大
+    const resolved = this.chPeak > 0 && isFinite(this.chFloor)
+      && this.chFloor <= this.chPeak / c.rangeMin;
+    out.usable = resolved && !!this.chPos;
+    if (!this.chPos) return out;
+
+    // ---- 狀態機：一律跑，即使範圍還沒解析 ----
+    // 理由：**轉換本身就是證據**。若鎖定時燈已經亮著（停在紅燈後方的常見情形），
+    // 峰值 = 谷值、範圍未解析；但只要燈一暗下來，谷值就會掉到 0、
+    // 範圍在同一個畫格立刻解析（0 ≤ peak/3）。
+    // 若在這裡就 return，最重要的那個「鬆開」邊緣會被自己吞掉。
+    // 邊緣事件仍然只在解析後回報（見下方），狀態則交由呼叫端依 usable 決定要不要採用。
+    const want = val >= this.chPeak * c.onRatio ? 'on'
+      : val <= this.chPeak * c.offRatio ? 'off' : this.chState;
+    if (want !== this.chState) {
+      if (this.chPendingState !== want) { this.chPendingState = want; this.chPendingSince = now; }
+      if (now - this.chPendingSince >= c.confirmMs) {
+        const prev = this.chState;
+        this.chState = want;
+        this.chPendingState = null;
+        if (want === 'on' && prev !== 'on') { out.pressed = true; this.chPressTs = now; }
+        if (want === 'off' && prev === 'on') { out.released = true; }
+      }
+    } else {
+      this.chPendingState = null;
+    }
+    out.state = this.chState;
+    // 範圍還沒解析 → 有可能只是中央上部有個一直紅著的東西（貼紙、反光），
+    // 還不能當成剎車燈的邊緣事件回報
+    if (!out.usable) { out.pressed = false; out.released = false; }
+    return out;
   }
 
   /** 先驗對數勝算比：ln( P(熄燈│即將起步) / P(熄燈│不起步) ) */
@@ -201,14 +381,16 @@ export class BrakeLightDetector {
       this.lastDetail = 'capture-fail';
       return { state: 'unknown', released: false, usable: false };
     }
-    return this.updateFromStats(lampStats(img.data, w, h, b), now);
+    // boxW 用「影像座標」的框寬，不是裁切後的 —— 它是距離的代理，
+    // 而裁切寬度被 maxSide 夾住之後就失去了距離資訊
+    return this.updateFromStats(lampStats(img.data, w, h, b), now, box.w);
   }
 
   /**
    * 純判定：吃 lampStats 的輸出，輸出狀態與「剛剛熄滅」的邊緣事件。
    * 這裡沒有任何 DOM，也沒有任何絕對像素門檻 —— 全部是比值。
    */
-  updateFromStats(st, now) {
+  updateFromStats(st, now, boxW = Infinity) {
     const b = this.cfg.brakeLight;
     this.lastStats = st;
 
@@ -222,6 +404,8 @@ export class BrakeLightDetector {
       // 谷值往上放（忘記舊的低點），與峰值往下衰減對稱
       if (isFinite(this.floorL)) this.floorL /= decay;
       if (isFinite(this.floorR)) this.floorR /= decay;
+      this.chPeak *= decay;
+      if (isFinite(this.chFloor)) this.chFloor /= decay;
     }
     this.lastTs = now;
 
@@ -233,6 +417,11 @@ export class BrakeLightDetector {
       // usable:false → 呼叫端不該把這一段時間算成「沒看到剎車燈」的證據
       return { state: 'unknown', released: false, usable: false, primed: this.primed(now) };
     }
+
+    // ---- 第三剎車燈（優先）----
+    // 放在過曝檢查之後：全白的畫面會讓網格紅度歸零，看起來像「熄滅」
+    const ch = this._updateChmsl(st, now, boxW);
+    this.chUsable = ch.usable;
 
     // ---- 三個量，各有明確的分工 ----
     // (1) 對比 = 燈區紅度 / 車身紅度 → 紅色車身的漆面紅度會被除掉。
@@ -319,6 +508,14 @@ export class BrakeLightDetector {
     this.blinking = cycles >= b.blinkMinCycles;
     if (this.blinking) released = false;
 
+    // ---- 第三剎車燈可用時，它是權威 ----
+    // 落差 70 倍 vs 外側燈的 1.5 倍；而且法規要求「續亮不得閃爍」，
+    // 所以這條路徑連閃爍抑制都不需要（方向燈也不在中央上部）。
+    if (ch.usable) {
+      if (ch.state !== 'unknown') this.state = ch.state;
+      released = ch.released;
+    }
+
     if (released) this.releaseTs = now;
 
     this.lastDetail = `lvl=${lvlL.toFixed(0)}/${lvlR.toFixed(0)}`
@@ -327,7 +524,16 @@ export class BrakeLightDetector {
       + ` area=${this.areaL.toFixed(2)}/${this.areaR.toFixed(2)}`
       + ` core=${this.coreL.toFixed(0)}/${this.coreR.toFixed(0)}`
       + ` c=${contrast.toFixed(2)} sym=${sym.toFixed(2)}`
-      + ` ${this.state}${this.blinking ? ' BLINK' : ''}${present ? '' : ' no-pair'}`;
+      + ` ${this.state}${this.blinking ? ' BLINK' : ''}${present ? '' : ' no-pair'}`
+      + `
+      第三燈 ${ch.usable ? ch.state
+          : this.chFar ? '車太遠'
+          : !this.chPos ? '找不到'
+          : '範圍未解析'}`
+      + ` val=${this.chVal.toFixed(0)} peak=${this.chPeak.toFixed(0)}`
+      + ` floor=${fmt(this.chFloor)}`
+      + (this.chPos ? ` pos=${this.chPos.x.toFixed(2)},${this.chPos.y.toFixed(2)}` : '')
+      + (this.pressed(now) ? ' 已踩下' : '');
 
     return {
       state: this.state,
@@ -341,6 +547,13 @@ export class BrakeLightDetector {
       contrast,
       sym,
       level: Math.min(lvlL, lvlR),
+      // 第三剎車燈：pressed 是「暗了很久之後亮起」的邊緣 ——
+      // 自排打檔必須踩剎車，所以它是起步的前兆（實測領先約 9 秒）
+      chmsl: {
+        usable: ch.usable, state: ch.state, val: ch.val,
+        peak: this.chPeak, pos: this.chPos, far: this.chFar,
+      },
+      pressed: ch.pressed,
     };
   }
 

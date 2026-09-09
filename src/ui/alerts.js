@@ -66,6 +66,10 @@ export class AlertPresenter {
   }
 
   fire(event) {
+    // 無聲事件：只在畫面上留下痕跡，不出聲、不震動、不閃。
+    // 「前車踩下剎車」領先約 9 秒 —— 那麼早出聲只會變成干擾，
+    // 但它仍然是有價值的資訊（尤其在離線分析時間軸上）。
+    if (event.silent) return;
     this.sound(event.kind);
     this.vibrate(event.kind);
     this.flash(event.kind);

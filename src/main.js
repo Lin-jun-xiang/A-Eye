@@ -197,10 +197,11 @@ function renderBadges(hud, now) {
   const badges = [];
 
   // 剛觸發的事件停留 3 秒（「鬆剎車」只留 1.5 秒，它只是預告）
-  const hold = lastEventKind === 'release' ? 1500 : 3000;
+  const hold = lastEventKind === 'release' ? 1500
+    : lastEventKind === 'ready' ? 2500 : 3000;
   if (lastEventText && now - lastEventTs < hold) {
     const type = lastEventKind === 'green' ? 'green'
-      : lastEventKind === 'release' ? 'red' : 'move';
+      : (lastEventKind === 'release' || lastEventKind === 'ready') ? 'red' : 'move';
     badges.push({ type, text: lastEventText });
   }
 
@@ -249,6 +250,7 @@ function renderBadges(hud, now) {
         // 只看得到證據百分比的話，完全無法區分「訊號不足」和「某道閘門卡住」。
         text: `🚗 追蹤前車 #${hud.target.id}｜證據 ${pct}%${ttc}｜${d.reason}`
           + `｜剎車燈 ${BRAKE_LABEL[stableBrake(hud.brakeState, now)] || '?'}`
+          + (hud.brakeChmslUsable ? '(第三燈)' : '')
           + (hud.brakePrimed ? '⚡已預備' : '')
           + (hud.trusted ? '' : '｜⚠背景不可信'),
       });

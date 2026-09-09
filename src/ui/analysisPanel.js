@@ -20,6 +20,7 @@ const ROWS = [
   ['ego', '自車'],
   ['target', '前車'],
   ['brake', '剎車燈'],
+  ['chmsl', '第三剎車燈'],
   ['level', '燈位準'],
   ['evidence', '起步證據'],
   ['reason', '未觸發原因'],
@@ -124,6 +125,21 @@ export class AnalysisPanel {
     this._set('brake', (LBL[hud.brakeState] || '--')
       + (hud.brakePrimed ? '（已預備）' : '')
       + (hud.brakeBlinking ? '（閃爍中，抑制）' : ''));
+
+    // 第三剎車燈：可用時它是權威判據，所以要看得到它到底有沒有被找到
+    if (hud.brakeChmslUsable) {
+      const r = hud.brakeChmslPeak > 0 ? hud.brakeChmslVal / hud.brakeChmslPeak : 0;
+      const p = hud.brakeChmsl && hud.brakeChmsl.pos;
+      this._set('chmsl', `${hud.brakeChmslState === 'on' ? '亮' : hud.brakeChmslState === 'off' ? '熄' : '?'}`
+        + `　${hud.brakeChmslVal.toFixed(0)} / 峰值 ${hud.brakeChmslPeak.toFixed(0)} = ${r.toFixed(2)}`
+        + (p ? `　位置 ${p.x.toFixed(2)},${p.y.toFixed(2)}` : '')
+        + (hud.brakePressed ? '　已踩下' : ''));
+    } else {
+      // 三種「不可用」要分開講，否則實測時無法判斷是幾何沒對準還是還沒看到落差
+      this._set('chmsl', hud.brakeChmslFar ? '車太遠，暫不使用'
+        : !hud.brakeChmslFound ? '找不到（退回左右尾燈判定）'
+        : `已找到但還沒看過落差（val ${hud.brakeChmslVal.toFixed(0)}）—— 尚不採用`);
+    }
 
     // 位準與峰值並排 —— 判定「熄滅」靠的就是「位準 / 峰值」這個比值
     if (hud.brakePeak > 0) {

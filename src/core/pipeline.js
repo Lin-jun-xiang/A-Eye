@@ -165,6 +165,17 @@ export class Pipeline {
         if (brakeRes.released && cfg.brakeLight.alertOnRelease && canAlert && armed) {
           events.push({ type: 'release', text: '🟠 前車鬆開剎車，準備起步', kind: 'release' });
         }
+        // 「踩下」：自排車從 P/N 打入 D 必須踩剎車，所以「暗了很久之後亮起」
+        // 是起步的前兆 —— 實車量測領先約 9 秒（38.3s 踩下 → 47.4s 車動）。
+        // 但 9 秒太早，出聲會變成干擾，所以預設是**無聲事件**：
+        // 徽章與分析時間軸看得到，不發出聲音與震動。
+        if (brakeRes.pressed && canAlert && armed) {
+          events.push({
+            type: 'ready', kind: 'ready',
+            text: '⏸ 前車踩下剎車（可能正在打檔）',
+            silent: !cfg.brakeLight.chmsl.alertOnPress,
+          });
+        }
       }
     }
 
@@ -248,6 +259,15 @@ export class Pipeline {
         brakeDetail: this.brake.lastDetail,
         brakeCfg: cfg.brakeLight,
         // 判定「熄滅」靠的是「位準 / 峰值」這個比值，所以峰值與門檻要一起給 UI
+        // 第三剎車燈：可用時它就是權威判據（落差 70 倍 vs 外側燈的 1.5 倍）
+        brakeChmsl: brakeRes && brakeRes.chmsl ? brakeRes.chmsl : null,
+        brakeChmslState: this.brake.chState,
+        brakeChmslUsable: this.brake.chUsable,
+        brakeChmslVal: this.brake.chVal,
+        brakeChmslPeak: this.brake.chPeak,
+        brakeChmslFar: this.brake.chFar,
+        brakeChmslFound: !!this.brake.chPos,
+        brakePressed: this.brake.pressed(now),
         brakePeak: Math.min(this.brake.peakL, this.brake.peakR),
         brakeLevel: Math.min(this.brake.levelL, this.brake.levelR),
         brakeBlinking: this.brake.blinking,

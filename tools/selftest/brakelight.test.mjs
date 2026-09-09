@@ -221,6 +221,156 @@ console.log('=== 實車夜間量測的回歸測試（數字取自路測影片，
 }
 
 console.log('');
+console.log('=== 第三剎車燈（車頂中央那一顆）===');
+// 為什麼它比外側燈好一個數量級：外側那兩顆兼作尾燈，踩剎車只是「變更亮」
+// （實測 122 → 65，只差 1.5 倍）；第三剎車燈不接尾燈電路，只在踩剎車時亮
+// （實測 145 → 0，差 70 倍）。
+//
+// 下面的數字全部取自 2026-09-08 夜間路測的真實網格：
+//   踩著：燈格 142~147、網格中位數 23~39
+//   鬆開：燈格 0、網格中位數 5~7
+{
+  const C = B.chmsl;
+  /** 直接組出 lampStats 的輸出（含第三剎車燈的搜尋網格） */
+  const mkSt = ({ ch, chBg, side = 60, body = 20 }) => {
+    const vals = new Float32Array(C.cols * C.rows).fill(chBg);
+    // 燈在中央上部：實測是 12 格中的第 4~5 列、6 行中的第 0~1 行
+    for (const rx of [4, 5]) for (const ry of [0, 1]) vals[ry * C.cols + rx] = ch;
+    const h = new Int32Array(32);
+    h[Math.min(31, (side / 8) | 0)] = 1200;
+    h[1] = 2800;
+    return {
+      left: side, right: side, body,
+      histL: h, histR: h, nL: 4000, nR: 4000,
+      chGrid: {
+        vals, cols: C.cols, rows: C.rows,
+        cellW: C.searchXFrac / C.cols,
+        cellH: C.searchYFrac / C.rows,
+        xOff: 0.5 - C.searchXFrac / 2,
+      },
+      overexposed: 0.02, luma: 62, n: 12000,
+    };
+  };
+  const LIT = mkSt({ ch: 145, chBg: 23 });
+  const DARK = mkSt({ ch: 0, chBg: 6 });
+
+  const det = new BrakeLightDetector(CONFIG);
+  let t = 0, pressAt = null, relAt = null;
+  // 先暗一段（駕駛沒踩剎車 —— 實測那位駕駛整個停等 38 秒都沒踩）
+  for (; t < 1500; t += 100) det.updateFromStats(DARK, t, 270);
+  check('沒踩剎車時不會誤判為亮', det.chState !== 'on', det.lastDetail.split('\n')[1]);
+
+  const tOn = t;
+  for (; t < tOn + 1500; t += 100) {
+    const r = det.updateFromStats(LIT, t, 270);
+    if (r.pressed && pressAt === null) pressAt = t - tOn;
+  }
+  check('踩下剎車 → 偵測到「踩下」', pressAt !== null, `延遲 ${pressAt}ms（confirmMs=${C.confirmMs}）`);
+  check('第三剎車燈判據可用', det.chUsable);
+  check('狀態為 on', det.chState === 'on' && det.state === 'on');
+  check('位置鎖在中央（x 應接近 0.5）',
+    det.chPos && Math.abs(det.chPos.x - 0.5) < 0.06, `x=${det.chPos && det.chPos.x.toFixed(3)}`);
+
+  const tOff = t;
+  for (; t < tOff + 1500; t += 100) {
+    const r = det.updateFromStats(DARK, t, 270);
+    if (r.released && relAt === null) relAt = t - tOff;
+  }
+  check('鬆開剎車 → 偵測到「鬆開」', relAt !== null, `延遲 ${relAt}ms`);
+  check('動態範圍遠超門檻', det.chPeak / Math.max(det.chFloor, 1) > C.rangeMin,
+    `峰值 ${det.chPeak.toFixed(0)} / 谷值 ${det.chFloor.toFixed(0)}`);
+
+  // 車太遠 → 這顆燈只剩幾個像素，且搜尋區會吃到背景 → 不使用這條判據
+  const det2 = new BrakeLightDetector(CONFIG);
+  for (let k = 0; k < 20; k++) det2.updateFromStats(LIT, k * 100, C.minBoxW - 20);
+  check(`框寬 < ${C.minBoxW}px（車太遠）→ 不使用第三剎車燈`,
+    !det2.chUsable && det2.chFar);
+}
+
+console.log('');
+console.log('=== 鎖錯位置要能自己恢復 ===');
+// 實測踩過的坑：搜尋範圍原本設得太寬（x ±22%），右邊界碰到**右尾燈**，
+// 於是在第三燈還沒亮的時候就把追蹤位置鎖在尾燈上（值 68），
+// 之後真正的燈亮起（值 142）也讀不到 —— 因為它離追蹤位置太遠。
+// 搜尋範圍收窄後這個情形不會再由尾燈造成，但背景紅光仍可能出現在任何位置，
+// 所以「出現明顯更強的候選就重新鎖定」這條恢復路徑必須有效。
+{
+  const C = B.chmsl;
+  const mk = (cells, bg) => {
+    const vals = new Float32Array(C.cols * C.rows).fill(bg);
+    for (const [rx, ry, v] of cells) vals[ry * C.cols + rx] = v;
+    const h = new Int32Array(32); h[7] = 1200; h[1] = 2800;
+    return {
+      left: 60, right: 60, body: 20,
+      histL: h, histR: h, nL: 4000, nR: 4000,
+      chGrid: {
+        vals, cols: C.cols, rows: C.rows,
+        cellW: C.searchXFrac / C.cols, cellH: C.searchYFrac / C.rows,
+        xOff: 0.5 - C.searchXFrac / 2,
+      },
+      overexposed: 0.02, luma: 62, n: 12000,
+    };
+  };
+  const det = new BrakeLightDetector(CONFIG);
+  let t = 0;
+  // 先讓某個邊緣格出現 68（模擬背景紅光）→ 位置被鎖在那裡
+  for (; t < 1000; t += 100) det.updateFromStats(mk([[11, 3, 68]], 11), t, 270);
+  const wrongX = det.chPos && det.chPos.x;
+  check('先鎖在錯誤位置', det.chPos !== null && Math.abs(wrongX - 0.5) > 0.08,
+    `x=${wrongX && wrongX.toFixed(3)}`);
+
+  // 真正的第三燈在中央亮起（142），錯誤位置只剩 20
+  for (; t < 3000; t += 100) det.updateFromStats(mk([[4, 0, 142], [11, 3, 20]], 15), t, 270);
+  check('出現更強候選 → 重新鎖定到中央',
+    det.chPos && Math.abs(det.chPos.x - 0.5) < 0.06, `x=${det.chPos && det.chPos.x.toFixed(3)}`);
+  check('重新鎖定後狀態跟上', det.chState === 'on', det.lastDetail.split('\n')[1]);
+  // 重新鎖定當下燈已經亮著 → 範圍未解析 → 還不敢把它當剎車燈的邊緣事件。
+  // 但燈一熄，谷值就掉到 0、範圍在同一個畫格解析，「鬆開」照樣抓得到。
+  check('重新鎖定當下範圍還沒解析（誠實回報不可用）', !det.chUsable);
+  let rel = false;
+  for (; t < 5000; t += 100) {
+    if (det.updateFromStats(mk([[4, 0, 0], [11, 3, 20]], 6), t, 270).released) rel = true;
+  }
+  check('燈熄之後仍抓到「鬆開」', rel && det.chState === 'off', det.lastDetail.split('\n')[1]);
+}
+
+console.log('');
+console.log('=== 第三剎車燈可用時，它蓋過外側燈的判定 ===');
+// 夜間外側燈全程亮著（尾燈），單看它只有 1.5 倍落差、而且分不出尾燈/剎車。
+// 第三剎車燈可用時應該直接由它決定。
+{
+  const C = B.chmsl;
+  const mk = (ch, chBg) => {
+    const vals = new Float32Array(C.cols * C.rows).fill(chBg);
+    for (const rx of [4, 5]) for (const ry of [0, 1]) vals[ry * C.cols + rx] = ch;
+    const h = new Int32Array(32); h[15] = 1200; h[1] = 2800;   // 外側燈固定亮著
+    return {
+      left: 122, right: 122, body: 61,
+      histL: h, histR: h, nL: 4000, nR: 4000,
+      chGrid: {
+        vals, cols: C.cols, rows: C.rows,
+        cellW: C.searchXFrac / C.cols, cellH: C.searchYFrac / C.rows,
+        xOff: 0.5 - C.searchXFrac / 2,
+      },
+      overexposed: 0.02, luma: 62, n: 12000,
+    };
+  };
+  const det = new BrakeLightDetector(CONFIG);
+  let t = 0;
+  for (; t < 2000; t += 100) det.updateFromStats(mk(145, 23), t, 270);
+  // 鎖定時燈就已經亮著（停在正在踩剎車的車後面）→ 峰值 = 谷值、範圍未解析，
+  // 還分不出那是剎車燈還是中央的紅色貼紙 → 誠實地維持外側燈的 lit
+  check('鎖定時已亮著 → 先回報 lit（範圍未解析）',
+    det.state === 'lit' && !det.chUsable, det.lastDetail.split('\n')[1]);
+  const outerBefore = det.levelL;
+  let released = false;
+  for (; t < 4000; t += 100) if (det.updateFromStats(mk(0, 6), t, 270).released) released = true;
+  check('第三燈熄 → 即使外側燈完全沒變也判定鬆開', released && det.state === 'off',
+    `外側燈位準全程 ${outerBefore.toFixed(0)} → ${det.levelL.toFixed(0)}（沒變）`);
+  check('此時第三燈判據已可用（轉換本身就是證據）', det.chUsable);
+}
+
+console.log('');
 console.log('=== 先驗：熄燈給 SPRT 的對數勝算比 ===');
 {
   const det = new BrakeLightDetector(CONFIG);
