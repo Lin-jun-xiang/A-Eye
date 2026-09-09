@@ -13,6 +13,7 @@
 //   → 於是同一份 pipeline 可以同時被「即時 App」與「離線回放評測」驅動
 
 import { CONFIG } from '../config.js';
+import { iou } from '../util/math.js';
 import { Tracker } from '../tracking/tracker.js';
 import { OpticalFlow } from '../motion/opticalFlow.js';
 import { DepartureDetector } from '../motion/departure.js';
@@ -55,7 +56,12 @@ export class Pipeline {
     this.imuDisagree = 0;
     this.trusted = true;
     this.target = null;
-    this.stats = { ticks: 0, flowOk: 0, flowFail: {}, detections: 0 };
+    this.lastTargetBox = null;
+    this.lastTargetTs = 0;
+    this.stats = {
+      ticks: 0, flowOk: 0, flowFail: {}, detections: 0,
+      targetTicks: 0, targetFresh: 0, targetChanges: 0, evidenceResets: 0,
+    };
   }
 
   async initCv(loadScript) {
@@ -77,7 +83,12 @@ export class Pipeline {
     this.lastTickTs = 0;
     this.visEvidence = null;
     this.target = null;
-    this.stats = { ticks: 0, flowOk: 0, flowFail: {}, detections: 0 };
+    this.lastTargetBox = null;
+    this.lastTargetTs = 0;
+    this.stats = {
+      ticks: 0, flowOk: 0, flowFail: {}, detections: 0,
+      targetTicks: 0, targetFresh: 0, targetChanges: 0, evidenceResets: 0,
+    };
   }
 
   /** 偵測結果抵達（帶著它自己的影像時間戳，可能已延遲數百毫秒） */
@@ -142,14 +153,37 @@ export class Pipeline {
         lampWeightFn: (id) => this._lampWeight(id),
       });
     }
-    const targetChanged = target && this.target && target.id !== this.target.id;
-    if (targetChanged) {
-      // 換了目標 → 之前累積的證據對新目標無意義
-      this.departure.reset();
-      this.flow.reset();
-      this.brake.reset();
+    // ---- 換目標時要不要清空證據 ----
+    // 原本是「id 一變就清空」，但實車量測顯示這會在最需要警示的那一刻把證據丟掉：
+    // 夜間近距離的白車，YOLO 只有 21% 的畫格抓得到（76% 在 coasting），
+    // track 因此反覆被淘汰重建 —— 104 秒內換了 28 個 id。
+    // 每次換 id 就 reset，證據永遠從零開始（實測面板：證據 0%、reason=idle）。
+    //
+    // 但「id 變了」不等於「換了一台車」：track 死掉後在同一個位置被重建，
+    // 幾何上仍是同一台車。所以改用「新舊目標框的 IoU」判斷是不是同一個物體 ——
+    // 這是可觀測的幾何事實，比 track id 這個實作細節可靠。
+    const newBox = target ? target.boxAt(now) : null;
+    if (target && this.target && target.id !== this.target.id) {
+      const same = this.lastTargetBox && iou(this.lastTargetBox, newBox) >= cfg.tracker.sameTargetIou;
+      this.stats.targetChanges++;
+      if (!same) {
+        this.stats.evidenceResets++;
+        this.departure.reset();
+        this.flow.reset();
+        this.brake.reset();
+      }
+      // 幾何上是同一台車 → 保留證據。光流的錨定 ROI 本來就會在目標
+      // 跑出錨定框時自己重新錨定，不需要在這裡硬清。
     }
     this.target = target;
+    this.lastTargetBox = newBox;
+    if (target) this.lastTargetTs = now;
+    // 目標的「新鮮度」：這個 tick 的目標有沒有剛被偵測更新過。
+    // 這個比例就是上面那條因果鏈的源頭，必須看得見。
+    if (target) {
+      this.stats.targetTicks++;
+      if (now - target.lastSeenTs <= 1.8 * (1000 / cfg.loop.detectHz)) this.stats.targetFresh++;
+    }
 
     // ---- 3.5) 剎車燈（快路徑）----
     // 放在光流之前：它的結果會當成起步判定的先驗，而且比運動訊號早 0.3~1 秒。
@@ -214,7 +248,14 @@ export class Pipeline {
       // 沒有目標：coast 而非硬重置，短暫漏檢不該清空證據
       if (this.departure.lastMeasTs) this.departure.coast(now);
       else this.departure.reset();
-      if (!target) this.flow.reset();
+      // 這裡原本每個 tick 都 flow.reset()，代價很大：光流的特徵點與錨定 ROI
+      // 被立刻銷毀，目標一回來就得從零重新錨定、重新累積 240ms 基線。
+      // 而實車量測顯示目標「短暫消失」是常態（79% 的 tick 目標都不是新的）。
+      // 改成只有超過追蹤器的 coast 時間才真的放棄 —— 在那之前保留錨定，
+      // 目標回來時若還在錨定框內就能直接接續。
+      if (!target && this.lastTargetTs && now - this.lastTargetTs > cfg.tracker.maxCoastMs) {
+        this.flow.reset();
+      }
     }
 
     // ---- 5) 紅綠燈 ----
@@ -281,6 +322,7 @@ export class Pipeline {
         imuCalibrated: this.imu ? this.imu.calibrated : false,
         imuQuality: this.imu ? this.imu.calibX.quality : 0,
         stats: this.stats,
+        trackerStats: this.tracker.stats,
       },
     };
   }
@@ -371,6 +413,11 @@ export class Pipeline {
     const l = [];
     l.push(this.ego.debugLine());
     l.push(this.frontCar.debugLine());
+    const st = this.stats;
+    l.push(`target 新鮮 ${st.targetTicks ? (st.targetFresh / st.targetTicks * 100).toFixed(0) : '--'}%`
+      + ` 換手 ${st.targetChanges} 次（其中清空證據 ${st.evidenceResets} 次）`);
+    const ts2 = this.tracker.stats;
+    l.push(`偵測框 ${ts2.dets} 個 → 配對 ${ts2.matched} 新建 ${ts2.created} 淘汰 ${ts2.dropped}`);
     l.push(this.departure.debugLine());
     l.push(this.brake.debugLine());
     if (this.lastFlow) {

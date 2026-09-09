@@ -19,6 +19,7 @@ const ROWS = [
   ['time', '影片時間'],
   ['ego', '自車'],
   ['target', '前車'],
+  ['track', '追蹤品質'],
   ['brake', '剎車燈'],
   ['chmsl', '第三剎車燈'],
   ['level', '燈位準'],
@@ -106,10 +107,23 @@ export class AnalysisPanel {
       : `${hud.egoLabel}（${hud.egoSource}`
         + (z === null || z === undefined ? '' : ` z=${z.toFixed(1)}`) + '）');
 
+    const st = hud.stats;
     const t = hud.target;
     this._set('target', t
       ? `#${t.id}  ${Math.round(t.box.w)}x${Math.round(t.box.h)}px  ${(t.score * 100) | 0}%`
       : '未鎖定');
+
+    // 目標「新鮮度」= 有多少比例的 tick 目標剛被偵測更新過。
+    // 這是整條因果鏈的源頭：偵測抓不到 → track 被淘汰重建 → 證據清空。
+    // 實車量測過 21%（夜間近距離的白車），沒有這一行完全看不出問題在偵測。
+    if (st && st.targetTicks) {
+      const k = hud.trackerStats;
+      this._set('track', `目標新鮮 ${(st.targetFresh / st.targetTicks * 100).toFixed(0)}%`
+        + `　換手 ${st.targetChanges}（清空證據 ${st.evidenceResets}）`
+        + (k ? `　偵測框 ${k.dets}→配對 ${k.matched} 新建 ${k.created}` : ''));
+    } else {
+      this._set('track', '--');
+    }
 
     // 用持續存在的狀態，不用單一 tick 的回傳 —— 分析頻率低於畫面幀率，
     // 若只在有量測的那一幀才有值，面板會在數值與 -- 之間跳
@@ -159,7 +173,6 @@ export class AnalysisPanel {
       this._set('reason', d.reason || '--');
     }
 
-    const st = hud.stats;
     if (st) {
       const fails = Object.entries(st.flowFail || {}).sort((a, b2) => b2[1] - a[1]);
       const total = st.flowOk + fails.reduce((a, [, v]) => a + v, 0);

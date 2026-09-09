@@ -71,7 +71,14 @@ export const CONFIG = {
     centerGateRatio: 1.2,   // 中心距離 ≤ 1.2 × 框對角線 → 仍可關聯
     scaleGate: 2.2,         // 面積比在 1/2.2 ~ 2.2 之間才可關聯
     confirmHits: 2,         // 連續命中數 → 確認為正式 track
-    maxCoastMs: 700,        // 目標暫時消失後仍以 KF 慣性維持的時間
+    // 目標暫時消失後仍以 KF 慣性維持的時間。
+    // 700ms 是實車量測後調高的：夜間近距離的白車，YOLO 只有 21% 的畫格抓得到，
+    // 700ms 一到就淘汰 track、下一次偵測建立新 id → 證據被清空。
+    // 對靜止或慢速目標，KF 外推 1.5 秒仍然安全（誤差來自加速度項）。
+    maxCoastMs: 1500,
+    // 換了 track id 時，用新舊目標框的 IoU 判斷是不是同一台車。
+    // 「id 變了」是實作細節，「幾何上是同一個物體」才是該用的判準。
+    sameTargetIou: 0.5,
     // KF 過程雜訊（物理意義：影像座標的加速度強度）
     qCenter: 4e4,           // px²/s³
     qLogSize: 0.8,          // (log px)²/s³

@@ -293,5 +293,69 @@ console.log('=== 自車結構黑名單：只在自車行駛中學習 ===');
 }
 
 console.log('');
+console.log('=== 偵測間歇時，track 不該一直被淘汰重建 ===');
+// 實車量測（2026-09-09 夜間，近距離白車）：YOLO 只有 21% 的畫格抓得到這台車、
+// 76% 在 coasting，於是 track 反覆被淘汰重建 —— 104 秒內換了 28 個 id。
+// 而 pipeline 原本「id 一變就清空證據」，導致證據永遠從零開始（實測 證據 0%）。
+{
+  const still = project(8, 0);
+  const gaps = [400, 800, 1200, 1600, 2000];
+  console.log(`  maxCoastMs = ${CONFIG.tracker.maxCoastMs}ms`);
+  for (const gap of gaps) {
+    const tr = new Tracker(CONFIG);
+    const ids = new Set();
+    let ts = 0;
+    // 先建立並確認 track
+    for (let i = 0; i < 3; i++, ts += 125) { tr.update([still], ts); tr.tracks.forEach((t) => ids.add(t.id)); }
+    // 中間空白 gap 毫秒（沒有任何偵測），再給一次偵測
+    ts += gap;
+    tr.update([still], ts);
+    tr.tracks.forEach((t) => ids.add(t.id));
+    const survived = ids.size === 1;
+    ok(`空白 ${String(gap).padStart(4)}ms → ${survived ? '同一個 track' : `重建（產生 ${ids.size} 個 id）`}`,
+      gap <= CONFIG.tracker.maxCoastMs ? survived : true);
+  }
+}
+
+console.log('');
+console.log('=== 目標為什麼會「消失」：淘汰在關聯之後，真正的閘門是新鮮度 ===');
+// 寫測試時發現我原本的理解是錯的：Tracker 的淘汰（filter maxCoastMs）發生在
+// **關聯之後**，所以只要偵測最終回來且配對成功，track 就不會因為空白而死掉
+// —— 上面那組測試裡 2000ms 空白也還是同一個 track。
+//
+// 真正讓「目標」消失的是 confirmedOf(classIds, now, maxCoastMs) 這道新鮮度過濾：
+// 超過 maxCoastMs 沒有新偵測的 track 不會被交給前車選取。
+// 於是 pipeline 走進「沒有目標」的分支 —— 那裡原本每個 tick 都 flow.reset()，
+// 把光流的特徵點與錨定 ROI 立刻銷毀。這才是實車上證據累積不起來的主要機制。
+{
+  const tr = new Tracker(CONFIG);
+  const still = project(8, 0);
+  let ts = 0;
+  for (let i = 0; i < 3; i++, ts += 125) tr.update([still], ts);
+  const id = tr.tracks[0].id;
+  const box = tr.tracks[0].boxAt(ts);
+  const lastSeen = ts - 125;
+
+  for (const gap of [500, 1400, 1600, 3000]) {
+    const now = lastSeen + gap;
+    const sel = tr.confirmedOf(CONFIG.vehicleClasses, now);
+    const expected = gap <= CONFIG.tracker.maxCoastMs;
+    ok(`空白 ${String(gap).padStart(4)}ms → 前車選取${sel.length ? '看得到' : '看不到'}這個 track`,
+      (sel.length > 0) === expected);
+  }
+  // track 本身還活著（沒有被淘汰）——它只是「不夠新鮮」
+  ok('track 本身仍在清單中（只是不夠新鮮）', tr.tracks.some((t) => t.id === id));
+
+  // 若真的換成旁車道的另一台車，IoU 低 → 證據必須清空
+  const other = project(8, 3.5);
+  const ov = iou(box, other);
+  ok(`換成旁車道的車時 IoU 低（${ov.toFixed(2)} < ${CONFIG.tracker.sameTargetIou}）→ 會清空證據`,
+    ov < CONFIG.tracker.sameTargetIou);
+  // 同一位置重建的框 IoU 高 → 保留證據
+  ok(`同一位置重建的框 IoU 高（${iou(box, still).toFixed(2)} ≥ ${CONFIG.tracker.sameTargetIou}）→ 保留證據`,
+    iou(box, still) >= CONFIG.tracker.sameTargetIou);
+}
+
+console.log('');
 console.log(failCount ? `❌ ${failCount} 項未通過` : '✅ 全部通過');
 if (failCount) process.exitCode = 1;

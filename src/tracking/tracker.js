@@ -33,9 +33,17 @@ export class Tracker {
   constructor(cfg = CONFIG) {
     this.cfg = cfg;
     this.tracks = [];
+    // 關聯的收支帳。實車除錯需要分辨兩種完全不同的失效：
+    //   偵測進來但配不上 → 關聯門檻的問題
+    //   偵測根本沒進來   → 偵測器的問題
+    // 沒有這兩個數字，只看得到「目標一直是舊的」而不知道該修哪一邊。
+    this.stats = { dets: 0, matched: 0, created: 0, dropped: 0 };
   }
 
-  reset() { this.tracks.length = 0; }
+  reset() {
+    this.tracks.length = 0;
+    this.stats = { dets: 0, matched: 0, created: 0, dropped: 0 };
+  }
 
   /**
    * @param dets 偵測結果 [{x,y,w,h,score,classId}]
@@ -95,12 +103,19 @@ export class Tracker {
     for (let i = 0; i < tracks.length; i++) if (!tUsed[i]) tracks[i].misses++;
 
     // 4) 未配對的偵測 → 新 track
+    let created = 0;
     for (let j = 0; j < dets.length; j++) {
-      if (!dUsed[j]) tracks.push(new Track(dets[j], ts, this.cfg));
+      if (!dUsed[j]) { tracks.push(new Track(dets[j], ts, this.cfg)); created++; }
     }
 
     // 5) 淘汰超過 coast 時間的 track
+    const before = tracks.length;
     this.tracks = tracks.filter((tr) => ts - tr.lastSeenTs <= t.maxCoastMs);
+
+    this.stats.dets += dets.length;
+    this.stats.matched += dets.length - created;
+    this.stats.created += created;
+    this.stats.dropped += before - this.tracks.length;
     return this.tracks;
   }
 
