@@ -97,7 +97,13 @@ export class AnalysisPanel {
     this.lastRender = now;
 
     this._set('time', `${videoTime.toFixed(2)} / ${duration.toFixed(1)} s`);
-    this._set('ego', hud.assumeStill ? '假設靜止（影片無 GPS/IMU）' : hud.egoLabel);
+    // 影片沒有 GPS / IMU，所以自車狀態是靠影片自己的背景尺度判斷的（visual-scale）。
+    // 把 z 值一起顯示 —— 否則「為什麼判成行駛中」完全無法診斷。
+    const z = hud.bgExpZ;
+    this._set('ego', hud.assumeStill
+      ? '強制假設靜止'
+      : `${hud.egoLabel}（${hud.egoSource}`
+        + (z === null || z === undefined ? '' : ` z=${z.toFixed(1)}`) + '）');
 
     const t = hud.target;
     this._set('target', t
@@ -106,7 +112,15 @@ export class AnalysisPanel {
 
     // 用持續存在的狀態，不用單一 tick 的回傳 —— 分析頻率低於畫面幀率，
     // 若只在有量測的那一幀才有值，面板會在數值與 -- 之間跳
-    const LBL = { on: '亮', off: '熄', unknown: '不確定' };
+    // lit 與 on 的差別是整個判定的關鍵：只看過一個位準時，無法知道那是
+    // 尾燈還是剎車燈（實車量測同一台車兩者差 5.9 倍）。判「熄」有證據，
+    // 判「踩著」不能用預設值充當。
+    const LBL = {
+      on: '踩著（範圍已解析）',
+      lit: '亮著，但分不出尾燈/剎車（尚未看過落差）',
+      off: '已鬆開',
+      unknown: '不確定',
+    };
     this._set('brake', (LBL[hud.brakeState] || '--')
       + (hud.brakePrimed ? '（已預備）' : '')
       + (hud.brakeBlinking ? '（閃爍中，抑制）' : ''));

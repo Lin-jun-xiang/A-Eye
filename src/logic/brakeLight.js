@@ -130,6 +130,8 @@ export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
   };
 }
 
+const fmt = (v) => (isFinite(v) ? v.toFixed(0) : '--');
+
 export class BrakeLightDetector {
   constructor(cfg = CONFIG) {
     this.cfg = cfg;
@@ -141,17 +143,26 @@ export class BrakeLightDetector {
   }
 
   reset() {
-    this.state = 'unknown';       // 'on' | 'off' | 'unknown'
+    // 'on'      剎車中（動態範圍已解析，且位準在高檔）
+    // 'lit'     有一對紅燈亮著，但還分不出是尾燈還是剎車燈
+    // 'off'     位準明顯低於峰值 → 剎車已鬆開
+    // 'unknown' 過曝，或看不到一對紅燈
+    this.state = 'unknown';
     this.everOn = false;          // 是否曾確認過「有一對紅燈」
     this.coreL = 0; this.coreR = 0;       // 燈芯亮度峰值（決定面積門檻 θ）
     this.peakL = 0; this.peakR = 0;       // 「亮起來的面積」峰值 ← 判定 on/off 用這個
     this.areaL = 0; this.areaR = 0;       // 本 tick 的面積
     this.levelL = 0; this.levelR = 0;     // 本 tick 的位準（面積×亮度）
+    // 位準的谷值 —— 與峰值一起決定動態範圍。Infinity = 還沒觀察到。
+    // 用 Infinity 而不是 0 當初值：完全熄滅時位準就是 0，
+    // 若用 0 當哨兵，最乾淨的那種落差反而會被當成「還沒觀察到」。
+    this.floorL = Infinity; this.floorR = Infinity;
     this.offSince = 0;
     this.lastTs = 0;
     this.releaseTs = -Infinity;   // 最近一次確認「熄滅」的時刻
     this.offEdges = [];           // 近期 on→off 的時刻（判斷雙閃/方向燈用）
     this.blinking = false;
+    this.resolved = false;   // 動態範圍是否已足以區分尾燈與剎車燈
     this.lastDetail = 'idle';
     this.lastStats = null;
   }
@@ -208,6 +219,9 @@ export class BrakeLightDetector {
       this.peakR *= decay;
       this.coreL *= decay;
       this.coreR *= decay;
+      // 谷值往上放（忘記舊的低點），與峰值往下衰減對稱
+      if (isFinite(this.floorL)) this.floorL /= decay;
+      if (isFinite(this.floorR)) this.floorR /= decay;
     }
     this.lastTs = now;
 
@@ -258,16 +272,28 @@ export class BrakeLightDetector {
 
     if (present) {
       this.everOn = true;
+      // 峰值只在「確認有一對紅燈」時更新，免得雜訊或旁車的紅光拉高它
       if (lvlL > this.peakL) this.peakL = lvlL;
       if (lvlR > this.peakR) this.peakR = lvlR;
     }
+    // 谷值不受 present 限制：它的語意是「這個區域曾經多暗」，與有沒有燈無關。
+    // 燈全暗時 present 會（正確地）變成 false —— 若把谷值鎖在 present 裡面，
+    // 最乾淨的那個低點永遠記錄不到，動態範圍就永遠解析不了。
+    if (lvlL < this.floorL) this.floorL = lvlL;
+    if (lvlR < this.floorR) this.floorR = lvlR;
 
     let released = false;
     const havePeak = this.peakL > 0 && this.peakR > 0;
+    // 動態範圍是否足以區分「尾燈」與「剎車燈」
+    // 寫成不等式而不是除法，這樣 floor = 0（完全熄滅）自然代表範圍無限大
+    this.resolved = isFinite(this.floorL) && isFinite(this.floorR)
+      && this.floorL <= this.peakL / b.onRange
+      && this.floorR <= this.peakR / b.onRange;
 
     if (havePeak && present && lvlL >= this.peakL * b.onRatio
         && lvlR >= this.peakR * b.onRatio) {
-      this.state = 'on';
+      // 位準在自身高檔 —— 但只有在動態範圍已解析時才敢說是「剎車中」
+      this.state = this.resolved ? 'on' : 'lit';
       this.offSince = 0;
     } else if (havePeak) {
       const downL = lvlL < this.peakL * b.offRatio;
@@ -297,6 +323,7 @@ export class BrakeLightDetector {
 
     this.lastDetail = `lvl=${lvlL.toFixed(0)}/${lvlR.toFixed(0)}`
       + ` peak=${this.peakL.toFixed(0)}/${this.peakR.toFixed(0)}`
+      + ` floor=${fmt(this.floorL)}/${fmt(this.floorR)}`
       + ` area=${this.areaL.toFixed(2)}/${this.areaR.toFixed(2)}`
       + ` core=${this.coreL.toFixed(0)}/${this.coreR.toFixed(0)}`
       + ` c=${contrast.toFixed(2)} sym=${sym.toFixed(2)}`
@@ -310,6 +337,7 @@ export class BrakeLightDetector {
       primed: this.primed(now),
       everOn: this.everOn,
       present,
+      resolved: this.resolved,
       contrast,
       sym,
       level: Math.min(lvlL, lvlR),

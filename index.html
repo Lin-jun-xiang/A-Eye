@@ -217,6 +217,12 @@ body {
       <input type="checkbox" id="enable-light" checked>
       <span>🚦 紅綠燈偵測</span>
     </label>
+    <!-- 只在影片模式顯示：預設用影片自己的視覺證據判斷自車動不動，
+         勾選後才強制假設靜止（適合光流還沒運作或沒有前車目標的片段） -->
+    <label class="feature-toggle" id="toggle-still-label" style="display:none">
+      <input type="checkbox" id="assume-still">
+      <span>🛑 強制假設自車靜止</span>
+    </label>
   </div>
   <div id="controls">
     <button id="toggle-btn" class="start"><svg class="btn-icon"><use href="#logo"/></svg> 開始偵測</button>

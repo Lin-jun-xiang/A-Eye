@@ -55,7 +55,10 @@ console.log('=== 基本：亮 → 熄，且熄滅需持續 offConfirmMs ===');
   const off = render(GREY, DARK, DARK);
   let t = 0;
   for (; t < 2000; t += 100) feed(det, on, t);
-  check('踩剎車時 state=on', det.state === 'on', det.lastDetail);
+  // 只看過一個位準時，無法知道那是尾燈還是剎車燈 —— 所以只能說「有紅燈亮著」。
+  // 判「熄」有證據（落差本身就是證據），判「剎車中」不能用預設值充當。
+  check('只看過一個位準 → state=lit（有紅燈但分不出尾燈/剎車）',
+    det.state === 'lit', det.lastDetail);
 
   const r1 = feed(det, off, t); t += 100;
   check('熄滅第 1 幀還不承認（需持續 ' + B.offConfirmMs + 'ms）', !r1.released && det.state !== 'off');
@@ -69,6 +72,12 @@ console.log('=== 基本：亮 → 熄，且熄滅需持續 offConfirmMs ===');
   check('持續熄滅後觸發 released', released, `延遲 ${releaseAt}ms`);
   check('released 只發生一次（邊緣事件）',
     !feed(det, off, t + 100).released);
+
+  // 有了「亮」與「熄」兩個位準，動態範圍才算解析 → 之後再踩下去就敢說剎車中
+  t += 200;
+  for (let i = 0; i < 10; i++, t += 100) feed(det, on, t);
+  check('經歷一次熄滅後，再踩剎車 → state=on（範圍已解析）',
+    det.state === 'on', det.lastDetail);
 }
 
 console.log('');
@@ -194,7 +203,8 @@ console.log('=== 實車夜間量測的回歸測試（數字取自路測影片，
   const det = new BrakeLightDetector(CONFIG);
   let t = 0;
   for (; t < 3000; t += 100) det.updateFromStats(LIT, t);
-  check('亮燈時 state=on', det.state === 'on', det.lastDetail);
+  check('亮燈時 state=lit（尚未看過落差，不敢斷言是剎車）',
+    det.state === 'lit', det.lastDetail);
   const lit = det.peakL;
 
   let released = false, at = 0;

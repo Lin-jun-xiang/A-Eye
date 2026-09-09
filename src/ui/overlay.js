@@ -175,7 +175,7 @@ export class Overlay {
     const hh = box.h * (b.yBottom - b.yTop);
     const sw = box.w * b.sideFrac;
     const cw = box.w * b.centerFrac;
-    const on = hud.brakeState === 'on';
+    const on = hud.brakeState === 'on' || hud.brakeState === 'lit';
     const col = on ? 'rgba(239,68,68,0.9)' : 'rgba(148,163,184,0.7)';
     this._drawBox({ x: box.x, y: y0, w: sw, h: hh }, { color: col, width: 1 });
     this._drawBox({ x: box.x + box.w - sw, y: y0, w: sw, h: hh }, { color: col, width: 1 });

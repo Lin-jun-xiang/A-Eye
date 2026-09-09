@@ -224,6 +224,7 @@ export class Pipeline {
       hud: {
         ego: this.ego.state,
         egoSource: this.ego.source,
+        bgExpZ: this.visEvidence ? this.visEvidence.bgExpZ : null,
         egoLabel: this.ego.label,
         canAlert,
         assumeStill: this.assumeStill,

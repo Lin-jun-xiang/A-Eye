@@ -66,7 +66,8 @@ let shownBrake = { state: 'unknown', since: 0, pending: null, pendingSince: 0 };
 const eventLog = [];
 
 const BTN_ICON = '<svg class="btn-icon"><use href="#logo"/></svg>';
-const BRAKE_LABEL = { on: '亮', off: '熄', unknown: '?' };
+// lit = 有一對紅燈亮著，但還分不出是尾燈還是剎車燈（只看過一個位準）
+const BRAKE_LABEL = { on: '踩著', lit: '亮(未確認)', off: '熄', unknown: '?' };
 
 // ---------- 小工具 ----------
 function loadScript(src) {
@@ -106,6 +107,10 @@ function initToggles() {
   } catch (_) { /* ignore */ }
   $('enable-car').addEventListener('change', readToggles);
   $('enable-light').addEventListener('change', readToggles);
+  // 影片模式的「強制假設靜止」可以在播放中即時切換 —— 比重新載入影片快得多
+  $('assume-still').addEventListener('change', () => {
+    if (fileMode) pipeline.assumeStill = $('assume-still').checked;
+  });
   readToggles();
 }
 
@@ -205,12 +210,16 @@ function renderBadges(hud, now) {
     return;
   }
 
-  if (hud.assumeStill) {
-    badges.push({ type: 'idle', text: '📁 影片模式 — 假設自車靜止' });
-  } else if (hud.ego === EgoState.MOVING) {
-    badges.push({ type: 'idle', text: `🚙 ${hud.egoLabel} — 靜默中` });
-  } else if (hud.ego === EgoState.UNKNOWN) {
-    badges.push({ type: 'idle', text: '❓ 自車狀態未知（等待 GPS / IMU）' });
+  if (fileMode) {
+    badges.push({ type: 'idle',
+      text: '📁 影片模式' + (hud.assumeStill ? '（強制假設靜止）' : '') });
+  }
+  if (!hud.assumeStill) {
+    if (hud.ego === EgoState.MOVING) {
+      badges.push({ type: 'idle', text: `🚙 ${hud.egoLabel} — 靜默中` });
+    } else if (hud.ego === EgoState.UNKNOWN) {
+      badges.push({ type: 'idle', text: '❓ 自車狀態未知（等待 GPS / IMU）' });
+    }
   }
 
   // 影片模式：詳細資訊都在分析面板裡，底部只留「事件」與「模式」兩條。
@@ -276,7 +285,12 @@ async function start(videoFile = null) {
       // 影片檔沒有 GPS / IMU，自車是否靜止無從得知。
       // 若照原本的規則（unknown → 靜默），影片模式會一個警示都不出 ——
       // 所以這裡明確假設自車靜止，並在畫面上標示出來，不讓它變成隱性行為。
-      pipeline.assumeStill = true;
+      // 不再預設假設靜止。影片自己就能判斷自車動不動 ——
+      // GPS/IMU 都不可用時，判定會降級到「背景尺度變化率」那一路：
+      // 自車前進 → 背景逼近 → 尺度 > 1。用假設取代量測的代價是：
+      // 行駛中的影片會被當成停著，於是前車自然的遠離全部變成「前車已起步」。
+      pipeline.assumeStill = $('assume-still').checked;
+      $('toggle-still-label').style.display = '';
       // 顯示方式與 overlay 的座標映射必須一起切換
       video.classList.add('contain');
       overlay.fit = 'contain';
@@ -285,6 +299,7 @@ async function start(videoFile = null) {
       const dim = await frames.startCamera(CONFIG.camera);
       vw = dim.vw; vh = dim.vh;
       pipeline.assumeStill = false;
+      $('toggle-still-label').style.display = 'none';
       video.classList.remove('contain');
       overlay.fit = 'cover';
 
@@ -339,6 +354,7 @@ async function start(videoFile = null) {
     video.classList.remove('contain');
     overlay.fit = 'cover';
     analysis.setVisible(false);
+    $('toggle-still-label').style.display = 'none';
     toggleBtn.disabled = false;
     toggleBtn.innerHTML = `${BTN_ICON} 開始偵測`;
     toggleBtn.className = 'start';
@@ -365,6 +381,7 @@ async function stop() {
   video.classList.remove('contain');
   overlay.fit = 'cover';
   analysis.setVisible(false);
+  $('toggle-still-label').style.display = 'none';
   gps.stop();
   imu.stop();
   detector.dispose();
