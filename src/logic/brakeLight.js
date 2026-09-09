@@ -98,9 +98,12 @@ export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
   const cw = Math.max(1, Math.round(w * cfg.centerFrac));
   const cx0 = Math.max(0, Math.round((w - cw) / 2));
 
+  // 車身參考區用「燈帶以下」的中央 —— 必須避開位於車後中線的第三剎車燈
+  const by0 = Math.max(0, Math.round(h * cfg.bodyYTop));
+  const by1 = Math.min(h, Math.max(by0 + 1, Math.round(h * cfg.bodyYBottom)));
   const hl = roiHist(data, w, 0, sw, y0, y1);
   const hr = roiHist(data, w, w - sw, w, y0, y1);
-  const hb = roiHist(data, w, cx0, cx0 + cw, y0, y1);
+  const hb = roiHist(data, w, cx0, cx0 + cw, by0, by1);
   const left = topKFromHist(hl.hist, hl.n, cfg.topKFrac);
   const right = topKFromHist(hr.hist, hr.n, cfg.topKFrac);
   const body = topKFromHist(hb.hist, hb.n, cfg.topKFrac);
@@ -459,6 +462,10 @@ export class BrakeLightDetector {
     // 否則面板會在「數值」與「--」之間跳（又是一種閃爍）
     this.levelL = lvlL; this.levelR = lvlR;
 
+    // 第三剎車燈被找到，本身就證明「這是一個有剎車燈的車尾」——
+    // 而且它比左右燈區的對比檢定可靠得多（實測那台車對比只有 0.72，
+    // 因為中央參考區被第三剎車燈自己汙染了）。
+    if (ch.usable || (this.chPos && this.chPeak > 0)) this.everOn = true;
     if (present) {
       this.everOn = true;
       // 峰值只在「確認有一對紅燈」時更新，免得雜訊或旁車的紅光拉高它

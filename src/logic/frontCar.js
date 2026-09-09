@@ -235,12 +235,15 @@ export class FrontCarSelector {
       // 幾何規則都直接的正向證據，而且與手機安裝方式完全無關。
       // 預設中性（1），只有在「觀察夠久卻始終沒看到燈」時才降權。
       const lampW = lampWeightFn ? lampWeightFn(tr.id) : 1;
+      // 新鮮度：coasting 的框是預測而不是量測，兩者同時存在時量測該贏。
+      const age = Math.max(0, now - tr.lastSeenTs);
+      const freshW = Math.pow(0.5, age / this.cfg.frontCar.plausibility.staleHalfLifeMs);
 
       // 底邊越低 = 越近（透視幾何）。正規化到 0~1。
       const proximity = clamp(
         ((box.y + box.h) / vh - this.horizon) / Math.max(1 - this.horizon, 1e-3), 0, 1
       );
-      const score = proximity * cw * laneW * plaus * lampW;
+      const score = proximity * cw * laneW * plaus * lampW * freshW;
 
       if (tr.id === this.selectedId) { current = tr; currentScore = score; }
       if (score > bestScore) { bestScore = score; best = tr; }

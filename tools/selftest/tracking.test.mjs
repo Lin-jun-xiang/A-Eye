@@ -235,12 +235,15 @@ console.log('=== 自車結構（引擎蓋／儀表板被 YOLO 認成 car）不�
   ok('實際選取鎖定真前車', !!picked && !!carTrack && picked.id === carTrack.id,
     `選中 id=${picked && picked.id} 真前車 id=${carTrack && carTrack.id}`);
 
-  // 加上「看很久卻沒有剎車燈」的證據後，差距應該更大
-  const lampW = (id) => (carTrack && id === carTrack.id ? 1 : CONFIG.frontCar.plausibility.noLampWeight);
-  ok('剎車燈正向證據把差距再拉開',
-    scoreOf(car) * 1 > scoreOf(hood) * CONFIG.frontCar.plausibility.noLampWeight * 2,
-    `${(scoreOf(car)).toFixed(3)} vs ${(scoreOf(hood) * CONFIG.frontCar.plausibility.noLampWeight).toFixed(3)}`);
-  void lampW;
+  // 剎車燈的證據是**加分**而不是扣分（扣分會造成自我毀滅的震盪，見 config 的說明）。
+  // 真前車一旦被確認看到尾燈就更難被搶走；引擎蓋則永遠拿不到這個加分。
+  // 有意義的門檻是選取器的遲滯（1.25×）：優勢要大於它，換手才不會發生。
+  const bonus = CONFIG.frontCar.plausibility.lampBonus;
+  const before = scoreOf(car) / scoreOf(hood);
+  const after = scoreOf(car) * bonus / scoreOf(hood);
+  ok('確認看到尾燈後，真前車的優勢超過選取遲滯（1.25×）',
+    after > 1.25 && after > before,
+    `優勢 ${before.toFixed(2)}× → ${after.toFixed(2)}×（加分 ${bonus}×）`);
 }
 
 console.log('');
@@ -354,6 +357,37 @@ console.log('=== 目標為什麼會「消失」：淘汰在關聯之後，真正
   // 同一位置重建的框 IoU 高 → 保留證據
   ok(`同一位置重建的框 IoU 高（${iou(box, still).toFixed(2)} ≥ ${CONFIG.tracker.sameTargetIou}）→ 保留證據`,
     iou(box, still) >= CONFIG.tracker.sameTargetIou);
+}
+
+console.log('');
+console.log('=== 過期的大框不該贏過新鮮的小框 ===');
+// 離線跑機在實車影片上量到的具體失效（148~166s，18 秒內目標換手 15 次、
+// 每次都清空證據）：前車起步駛遠後，一個已經過期但 KF 外推出來仍然很大的框
+// （328x204）與真實的新框（92x48）同時存在，而 score 的第一項 proximity
+// 只看底邊高度 → 過期的大框贏 → 目標在兩者之間來回跳。
+// coasting 的框是**預測**，不是量測；兩者同時存在時量測該贏。
+{
+  const sel = new FrontCarSelector(CONFIG);
+  sel.aspect = VH / VW;
+  const tr = new Tracker(CONFIG);
+  const near = project(6, 0);      // 近車：框大、底邊低
+  const far = project(25, 0);      // 同一條車道上遠一點的車：框小
+  let ts = 0;
+  for (let i = 0; i < 4; i++, ts += 125) tr.update([near, far], ts);
+  const nearTrack = tr.tracks.find((t) => iou(t.boxAt(ts), near) > 0.8);
+  const farTrack = tr.tracks.find((t) => iou(t.boxAt(ts), far) > 0.8);
+
+  // 兩個都新鮮 → 近車（proximity 高）應該贏
+  let pick = sel.select(tr.confirmedOf(CONFIG.vehicleClasses, ts), VW, VH, ts);
+  ok('兩個都新鮮時，近車勝出', pick && pick.id === nearTrack.id);
+
+  // 只餵遠車的偵測 → 近車開始過期
+  const hl = CONFIG.frontCar.plausibility.staleHalfLifeMs;
+  for (let i = 0; i < 8; i++, ts += 125) tr.update([far], ts);
+  pick = sel.select(tr.confirmedOf(CONFIG.vehicleClasses, ts), VW, VH, ts);
+  const nearAge = ts - nearTrack.lastSeenTs;
+  ok(`近車過期 ${nearAge}ms（半衰期 ${hl}ms）後，改選新鮮的遠車`,
+    pick && pick.id === farTrack.id, `選中 #${pick && pick.id}`);
 }
 
 console.log('');

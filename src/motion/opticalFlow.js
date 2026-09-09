@@ -254,10 +254,20 @@ export class OpticalFlow {
     };
   }
 
-  /** 以錨定 ROI 裁切原生解析度影像 → 灰階 cv.Mat */
+  /**
+   * 以錨定 ROI 裁切原生解析度影像 → 灰階 cv.Mat（並做對比度正規化）。
+   *
+   * CLAHE 不是可有可無的美化，夜間它決定這條路徑能不能運作：
+   * 實車量測顯示車尾有 81% 的像素落在最暗的 32 階，原始灰階上
+   * goodFeaturesToTrack 只撒得出 1 個前景點（下限 12）→ 每個 tick 都
+   * fg-too-few → 起步判定永遠收不到量測。CLAHE 之後同一幀變成 50 個點。
+   *
+   * 兩幀都套用同一個 CLAHE（局部單調的映射），所以 LK 的梯度假設仍然成立。
+   */
   _captureGray(source) {
     const a = this.anchor;
     if (!a || a.w < 8 || a.h < 8) return null;
+    const f = this.cfg.flow;
     this.canvas.width = this.roiW;
     this.canvas.height = this.roiH;
     this.ctx.drawImage(source, a.x, a.y, a.w, a.h, 0, 0, this.roiW, this.roiH);
@@ -265,7 +275,18 @@ export class OpticalFlow {
     const gray = new cv.Mat();
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
     src.delete();
-    return gray;
+    if (!(f.claheClip > 0)) return gray;
+    try {
+      if (!this._clahe) {
+        this._clahe = new cv.CLAHE(f.claheClip, new cv.Size(f.claheTiles, f.claheTiles));
+      }
+      const out = new cv.Mat();
+      this._clahe.apply(gray, out);
+      gray.delete();
+      return out;
+    } catch (e) {
+      return gray;      // 舊版 opencv.js 可能沒有 CLAHE → 退回原始灰階
+    }
   }
 
   // ---------- 特徵點 ----------
@@ -273,7 +294,8 @@ export class OpticalFlow {
   _sampleInMask(gray, mask, nMax) {
     const corners = new cv.Mat();
     try {
-      cv.goodFeaturesToTrack(gray, corners, nMax, 0.01, 6, mask, 3, false, 0.04);
+      cv.goodFeaturesToTrack(gray, corners, nMax,
+        this.cfg.flow.featureQuality, this.cfg.flow.featureMinDistPx, mask, 3, false, 0.04);
     } catch (e) {
       corners.delete();
       return null;

@@ -390,12 +390,15 @@ export class Pipeline {
     }
   }
 
-  /** 剎車燈的正向證據加權：預設中性，只有「看夠久卻沒燈」才降權 */
+  /**
+   * 剎車燈的正向證據加權：**只加分，不扣分**。
+   * 只有被選中的目標會被分析，所以「扣分」會變成自我毀滅的迴路
+   * （被選中者是唯一會被扣分的 → 一扣分就輸給沒被分析過的競爭者 → 震盪）。
+   * 加分則讓同樣的不對稱變成穩定性：已確認有尾燈的目標更難被搶走。
+   */
   _lampWeight(id) {
-    const p = this.cfg.frontCar.plausibility;
     const e = this.lampEvidence.get(id);
-    if (!e || e.everOn) return 1;
-    return e.ms >= p.noLampAfterMs ? p.noLampWeight : 1;
+    return e && e.everOn ? this.cfg.frontCar.plausibility.lampBonus : 1;
   }
 
   _corridorPoly(vw, vh) {
