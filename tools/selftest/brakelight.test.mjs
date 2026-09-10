@@ -417,6 +417,100 @@ console.log('=== 先驗：熄燈給 SPRT 的對數勝算比 ===');
 }
 
 console.log('');
+console.log('=== 框漂移時，第三剎車燈不得被讀成熄滅 ===');
+// 2026-09-10 夜間錄影量到的：第三剎車燈裝在車頂線上，而 YOLO 的框上緣
+// 「就是」車頂線 —— 兩者重疊在同一條線上，一點餘裕都沒有。
+//   t=5s（實線框，剛偵測）  燈在 bbox 內 y=0.036
+//   t=23s（虛線框，KF 外推）燈在 bbox **上方 27px**（y=−0.16）
+// 那 27 秒裡燈的紅度是 160~183 的常數（直接量錄影的像素，與 app 無關），
+// 一次都沒有熄過，app 卻反覆報「鬆開剎車 / 踩下剎車」。
+//
+// 兩道修法在這裡一起驗證：
+//   (a) 裁切往 bbox 上緣之外多留 topMarginFrac → 燈不會掉出搜尋範圍
+//   (b) 追蹤位置存**影像座標** → 框怎麼漂，取樣點都還在同一顆燈上
+{
+  const C = B.chmsl;
+  const BOX_W = 270, BOX_H = 250, BOX_X = 380;
+  const LAMP_X = BOX_X + BOX_W / 2;          // 車後中線
+  const LAMP_Y = 600 + 0.032 * BOX_H;        // 貼著車頂線（實測 y=0.036）
+
+  /** 依「當下的 bbox 位置」組出裁切矩形 + 對應的網格（燈固定在影像座標） */
+  const mkAt = (boxY, chVal, bg) => {
+    const m = C.topMarginFrac * BOX_H;
+    const cropY = Math.max(0, boxY - m);
+    const cropH = BOX_H + (boxY - cropY);
+    const geom = { yOff: (boxY - cropY) / cropH, yScale: BOX_H / cropH };
+    const cellW = C.searchXFrac / C.cols;
+    const bandH = geom.yOff + C.searchYFrac * geom.yScale;   // 搜尋帶佔裁切圖的比例
+    const cellH = bandH / C.rows;
+    const xOff = 0.5 - C.searchXFrac / 2;
+    const vals = new Float32Array(C.cols * C.rows).fill(bg);
+    // 燈落在哪一格，完全由「影像座標 → 裁切座標」決定
+    const nx = (LAMP_X - BOX_X) / BOX_W, ny = (LAMP_Y - cropY) / cropH;
+    const cx = Math.floor((nx - xOff) / cellW), cy = Math.floor(ny / cellH);
+    let inBand = false;
+    if (cx >= 0 && cx < C.cols && cy >= 0 && cy < C.rows) {
+      vals[cy * C.cols + cx] = chVal;
+      inBand = true;
+    }
+    const h = new Int32Array(32); h[15] = 1200; h[1] = 2800;  // 外側尾燈全程亮著
+    return {
+      st: {
+        left: 122, right: 122, body: 61,
+        histL: h, histR: h, nL: 4000, nR: 4000,
+        chGrid: { vals, cols: C.cols, rows: C.rows, cellW, cellH, xOff },
+        overexposed: 0.02, luma: 62, n: 12000,
+      },
+      crop: { x: BOX_X, y: cropY, w: BOX_W, h: cropH },
+      inBand,
+    };
+  };
+
+  check('框沒漂時燈在搜尋帶內', mkAt(600, 170, 20).inBand);
+  check('框往下漂 0.16 個框高，燈仍在搜尋帶內（靠 topMarginFrac 的餘裕）',
+    mkAt(600 + 0.16 * BOX_H, 170, 20).inBand,
+    `topMarginFrac=${C.topMarginFrac}`);
+
+  const det = new BrakeLightDetector(CONFIG);
+  let t = 0;
+  // 先亮一段再熄一次 —— 讓動態範圍解析，這條判據才會被採用
+  for (; t < 1500; t += 100) { const a = mkAt(600, 170, 20); det.updateFromStats(a.st, t, BOX_W, a.crop); }
+  for (; t < 3000; t += 100) { const a = mkAt(600, 0, 6); det.updateFromStats(a.st, t, BOX_W, a.crop); }
+  for (; t < 5000; t += 100) { const a = mkAt(600, 170, 20); det.updateFromStats(a.st, t, BOX_W, a.crop); }
+  check('燈亮著且範圍已解析 → on', det.chUsable && det.chState === 'on',
+    String(det.lastDetail).split(String.fromCharCode(10))[1]);
+
+  // ---- 燈一直亮著，只有框在漂 ----
+  let released = false, minVal = Infinity;
+  for (let k = 0; k < 30; k++, t += 100) {
+    const boxY = 600 + (k / 29) * 0.16 * BOX_H;      // 慢慢往下漂到 0.16 個框高
+    const a = mkAt(boxY, 170, 20);
+    const r = det.updateFromStats(a.st, t, BOX_W, a.crop);
+    if (r.released) released = true;
+    minVal = Math.min(minVal, det.chVal);
+  }
+  check('框漂移 0.16 個框高時不會誤報「鬆開剎車」', !released && det.chState === 'on',
+    `期間讀到的最低值 ${minVal.toFixed(0)}（燈全程 170）`);
+
+  // ---- 框逐幀抖動（YOLO 的框每幀都在抖）----
+  let released2 = false;
+  for (let k = 0; k < 40; k++, t += 100) {
+    const a = mkAt(600 + 0.16 * BOX_H + (k % 2 ? 8 : -8), 170, 20);
+    const r = det.updateFromStats(a.st, t, BOX_W, a.crop);
+    if (r.released) released2 = true;
+  }
+  check('框逐幀抖動 ±8px 時不會誤報「鬆開剎車」', !released2 && det.chState === 'on');
+
+  // ---- 真的熄了還是要抓得到 ----
+  let released3 = false;
+  for (let k = 0; k < 20; k++, t += 100) {
+    const a = mkAt(600 + 0.16 * BOX_H, 0, 6);
+    if (det.updateFromStats(a.st, t, BOX_W, a.crop).released) released3 = true;
+  }
+  check('燈真的熄滅時仍然抓得到「鬆開」', released3 && det.chState === 'off');
+}
+
+console.log('');
 if (fails) {
   console.log(`❌ ${fails} 項未通過`);
   process.exitCode = 1;

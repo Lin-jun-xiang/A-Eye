@@ -122,3 +122,98 @@ console.log('=== 視覺否決：GPS 說在動，但背景尺度完全沒變 ==='
 console.log('');
 console.log(fails ? `❌ ${fails} 項未通過` : '✅ 全部通過');
 if (fails) process.exitCode = 1;
+
+console.log('');
+console.log('=== 視覺判定自車運動：顯著 ≠ 夠大 ===');
+// 2026-09-10 實測面板：`bgExpZ=8.0`、門檻 4.0 → ego=moving(visual-scale)
+//   → canAlert=false → departure.update() 每 tick 走 reset()
+//   → `V=0.000±100.000 n=0 ego-moving`，整個起步判定無聲關閉。
+//
+// 但 8.0 這個 z 換算回物理量是背景 1/TTC ≈ 0.01（TTC 100 秒）——
+// 「10 公尺外的東西以 0.1 m/s 逼近」就是站著不動。
+// σ_s 是近百個背景點的標準誤（~3e-4），所以靜止也能量出很大的 z。
+//
+// 反向誘因才是真正致命的地方：光流做得越準 → σ 越小 → 同一個物理靜止
+// 產生越大的 z → 越容易被誤判成行駛中。
+{
+  const cfg = CONFIG;
+  const mk = () => new EgoMotionEstimator(cfg, null, null);
+
+  // (a) 實測那一組：z 很顯著，但物理上等於不動
+  {
+    const ego = mk();
+    ego.update(1000, { resid: null, bgExpZ: 8.0, bgInvTtc: 0.01 });
+    check('z=8.0 但背景 TTC 100 秒 → 判定靜止（警示不該被靜音）',
+      ego.state === EgoState.STILL, `state=${ego.state} source=${ego.source}`);
+    check('→ canAlert 為真', ego.canAlert);
+  }
+
+  // (b) 真的在動：兩個條件都成立
+  {
+    const ego = mk();
+    ego.update(1000, { resid: null, bgExpZ: 8.0, bgInvTtc: 0.30 });
+    check('z=8.0 且背景 TTC 3.3 秒 → 判定行駛中', ego.state === EgoState.MOVING,
+      `state=${ego.state}`);
+    check('→ canAlert 為假（行駛中不該報前車起步）', !ego.canAlert);
+  }
+
+  // (c) 物理量大但完全不顯著（雜訊）→ 不該說在動
+  {
+    const ego = mk();
+    ego.update(1000, { resid: null, bgExpZ: 1.2, bgInvTtc: 0.40 });
+    check('物理量大但 z 只有 1.2（雜訊）→ 仍判定靜止',
+      ego.state === EgoState.STILL, `state=${ego.state}`);
+  }
+
+  // (d) 光流變準（σ 減半 → z 加倍）不得改變物理結論
+  {
+    const a = mk(), b = mk();
+    a.update(1000, { resid: null, bgExpZ: 6.0, bgInvTtc: 0.02 });
+    b.update(1000, { resid: null, bgExpZ: 60.0, bgInvTtc: 0.02 });   // 光流準 10 倍
+    check('同一個物理靜止，z 從 6 變成 60，結論不變',
+      a.state === b.state && a.state === EgoState.STILL,
+      `${a.state} / ${b.state}`);
+  }
+
+  // (e) 沒有 bgInvTtc（舊介面）時退回只看 z —— 不能因為缺欄位就崩掉
+  {
+    const ego = mk();
+    ego.update(1000, { resid: null, bgExpZ: 8.0 });
+    check('舊介面（只有 bgExpZ）仍可運作', ego.state === EgoState.MOVING,
+      `state=${ego.state}`);
+  }
+}
+
+console.log('');
+console.log('=== 視覺判定要有 dwell：單一雜訊 tick 不得翻面 ===');
+// 實測 18 秒內 ego 在 still/moving 之間跳了 17 次，而每一次 moving
+// 都讓下游的起步證據歸零（t=48s n=7 → t=49s n=0）。
+{
+  const ego = new EgoMotionEstimator(CONFIG, null, null);
+  const still = { resid: null, bgExpZ: 1.0, bgInvTtc: 0.005 };
+  const move = { resid: null, bgExpZ: 9.0, bgInvTtc: 0.30 };
+  let t = 0;
+  for (; t < 2000; t += 100) ego.update(t, still);
+  check('先穩定在靜止', ego.state === EgoState.STILL);
+
+  ego.update(t, move); t += 100;
+  check('單一「在動」的 tick → 還不算行駛中', ego.state === EgoState.STILL,
+    `state=${ego.state}`);
+  ego.update(t, still); t += 100;
+  check('雜訊過去後仍是靜止', ego.state === EgoState.STILL);
+
+  const t0 = t;
+  let switched = null;
+  for (; t < t0 + 2000; t += 100) {
+    ego.update(t, move);
+    if (ego.state === EgoState.MOVING && switched === null) switched = t - t0;
+  }
+  check('持續「在動」→ 仍然會轉成行駛中', ego.state === EgoState.MOVING,
+    `延遲 ${switched}ms（門檻 ${CONFIG.ego.visualMoveDwellMs}ms）`);
+  check('轉換延遲符合 dwell 設定',
+    switched !== null && switched >= CONFIG.ego.visualMoveDwellMs - 1
+      && switched <= CONFIG.ego.visualMoveDwellMs + 200, `${switched}ms`);
+
+  ego.update(t, still);
+  check('退出行駛中不設 dwell（不對稱是刻意的）', ego.state === EgoState.STILL);
+}

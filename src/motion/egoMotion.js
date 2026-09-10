@@ -38,6 +38,7 @@ export class EgoMotionEstimator {
     this._lastVisResid = 0;
     this._aboveSince = 0;     // GPS 速度連續超過上緣的起始時刻
     this._vetoedTs = -Infinity;   // 最近一次用視覺否決 GPS 的時刻（除錯顯示用）
+    this._visMovingSince = 0;     // 視覺判定「在動」的持續起點（dwell 用）
   }
 
   reset() {
@@ -47,6 +48,7 @@ export class EgoMotionEstimator {
     this._visResidSigma = null;
     this._aboveSince = 0;
     this._vetoedTs = -Infinity;
+    this._visMovingSince = 0;
   }
 
   /**
@@ -61,10 +63,20 @@ export class EgoMotionEstimator {
     const visResid = (vis && typeof vis === 'object') ? vis.resid
       : (typeof vis === 'number' ? vis : null);
     const bgExpZ = (vis && typeof vis === 'object') ? vis.bgExpZ : null;
-    // 背景的尺度沒有顯著變化 → 沒有逼近任何東西 → 自車沒有前進。
-    // 旋轉不改變尺度，所以這個判據對手機晃動天然免疫（不像位移殘差）。
-    const visualStatic = bgExpZ !== null && bgExpZ !== undefined
-      && isFinite(bgExpZ) && Math.abs(bgExpZ) < e.visualStaticZ;
+    const bgInvTtc = (vis && typeof vis === 'object') ? vis.bgInvTtc : null;
+    // 背景沒有在逼近 → 自車沒有前進。旋轉不改變尺度，所以這個判據
+    // 對手機晃動天然免疫（不像位移殘差）。
+    //
+    // 但「有沒有逼近」要同時問兩件事，只問一件會壞：
+    //   顯著性 |z| —— σ_s 是近百個背景點的標準誤（~3e-4），站著不動
+    //                 也能量出 8σ。只看 z 會把靜止判成行駛中。
+    //   物理量 1/TTC —— 背景 TTC 100 秒（實測那次）就是站著不動。
+    // 兩者都超過門檻才敢說在動；任一不成立就是靜止。
+    const hasZ = bgExpZ !== null && bgExpZ !== undefined && isFinite(bgExpZ);
+    const hasV = bgInvTtc !== null && bgInvTtc !== undefined && isFinite(bgInvTtc);
+    const visualStatic = hasZ
+      && !(Math.abs(bgExpZ) >= e.visualStaticZ
+           && (!hasV || Math.abs(bgInvTtc) >= e.visualStaticInvTtc));
     // 否決是間歇發生的（每次否決會把 dwell 計時歸零，所以下一個 tick 又從頭算），
     // 但除錯面板需要看得到「剛剛否決過」，否則這條路徑幾乎永遠不會被顯示出來
     const vetoRecent = now - this._vetoedTs < 2000;
@@ -116,8 +128,20 @@ export class EgoMotionEstimator {
     // ---- 3) 視覺背景（最後備援）----
     // 背景在扣掉相機旋轉後仍有一致位移 → 自車在平移
     // 背景尺度率若可用，它比位移殘差更可靠（不受旋轉污染）
-    if (bgExpZ !== null && bgExpZ !== undefined && isFinite(bgExpZ)) {
-      this.state = visualStatic ? EgoState.STILL : EgoState.MOVING;
+    if (hasZ) {
+      // 與 GPS 那一路同樣的修法：進入 MOVING 要「持續」，不是一個尖峰。
+      // 光流的量測本來就叢發又稀疏（實測可用率 14~27%），逐 tick 直接翻面
+      // 會讓狀態每秒跳好幾次，而每一次都會讓下游的證據 coast 掉。
+      // 退出 MOVING 不設 dwell —— 誤判成靜止的代價（可能誤報）
+      // 比誤判成行駛的代價（整段靜默）小，而且靜止還有其他閘門把關。
+      if (visualStatic) {
+        this._visMovingSince = 0;
+        this.state = EgoState.STILL;
+      } else {
+        if (!this._visMovingSince) this._visMovingSince = now;
+        this.state = (now - this._visMovingSince >= e.visualMoveDwellMs)
+          ? EgoState.MOVING : EgoState.STILL;
+      }
       this.source = 'visual-scale';
       return this.state;
     }

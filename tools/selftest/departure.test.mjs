@@ -160,3 +160,41 @@ console.log('=== coast() 的衰減不得重複計算同一段時間 ===');
   const ok = Math.abs(a.llr - b.llr) < 1e-9 && Math.abs(a.llr - expect) < 1e-6;
   console.log(`  → ${ok ? '✅ 與呼叫次數無關' : '✗ 衰減量取決於呼叫次數'}`);
 }
+
+console.log('');
+console.log('=== ego 抖一下不得清空證據（最後一處硬歸零）===');
+let egoFails = 0;
+const check = (label, cond, note = '') => {
+  if (!cond) egoFails++;
+  console.log(`  ${cond ? '✅' : '✗ '} ${label}${note ? '  ' + note : ''}`);
+};
+// 自車狀態是逐 tick 判定的，會抖。原本 ego-moving 走 this.reset()，
+// 於是一個雜訊 tick 就能把 7 筆量測、LLR=6.2 全部歸零（2026-09-10 實測）。
+// 安全性靠的是 canAlert 擋住觸發，不是靠清空證據。
+{
+  const cfg = CONFIG;
+  const det = new DepartureDetector(cfg);
+  // armed:false → 證據照常累積但永遠不觸發，這樣測到的才是「證據有沒有被清掉」
+  const ctx = (ts, egoStill) => ({ ts, egoStill, trusted: true, primed: false, priorLlr: 0, armed: false });
+  // V=0.05（緩起步）：會累積證據但在這個時間尺度內還不會觸發，
+  // 這樣才測得到「證據有沒有被清掉」而不是「有沒有觸發」
+  const m = () => makeMeas(-0.05 * DT, -2);
+
+  let t = 0;
+  for (let i = 0; i < 10; i++, t += DT * 1000) det.update(m(), ctx(t, true));
+  const before = { n: det.ticks, llr: det.llr };
+  check(`累積到 n=${before.n} LLR=${before.llr.toFixed(1)}（尚未觸發）`,
+    before.n >= 5 && before.llr > 1, `n=${before.n}`);
+
+  det.update(m(), ctx(t, false)); t += DT * 1000;   // 一個 ego=moving 的雜訊 tick
+  check('單一 ego-moving tick 後證據仍在（只衰減，不歸零）',
+    det.ticks === before.n && det.llr > before.llr * 0.5,
+    `n=${det.ticks} LLR=${det.llr.toFixed(2)}（原本 ${before.llr.toFixed(2)}）`);
+  check('reason 有誠實回報', det.lastReason === 'ego-moving');
+
+  // 但持續行駛超過 coastMs 就該歸零
+  for (let i = 0; i < 40; i++, t += DT * 1000) det.update(m(), ctx(t, false));
+  check(`持續行駛 ${cfg.departure.coastMs}ms 以上 → 證據歸零`,
+    det.ticks === 0 && det.llr === 0, `n=${det.ticks} LLR=${det.llr.toFixed(2)}`);
+}
+if (egoFails) process.exitCode = 1;

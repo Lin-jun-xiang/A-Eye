@@ -100,6 +100,8 @@ export class Detector {
       };
 
       const y = this.cfg.yolo;
+      const fam = this.cfg.detector.family;
+      const d = this.cfg.detr;
       this.worker.postMessage({
         type: 'init',
         baseUrl: new URL('../../', import.meta.url).href,
@@ -107,11 +109,14 @@ export class Detector {
         ortBaseUrl: prepared ? prepared.baseUrl : null,
         ortSourceUrl: prepared ? prepared.sourceUrl : null,
         ortFallbackUrls: this.ortUrls(),
-        modelCandidates: y.modelCandidates,
+        family: fam,
+        detr: d,
+        modelCandidates: fam === 'detr' ? d.modelCandidates : y.modelCandidates,
         providers: y.providers,
         preferredInputSize: y.preferredInputSize,
         keepClasses: y.keepClasses,
         confThreshold: y.confThreshold,
+        confLow: y.confLow,
         iouThreshold: y.iouThreshold,
       });
     });

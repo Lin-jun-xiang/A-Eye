@@ -6,3 +6,17 @@ __pycache__/
 third_party/openlenda/
 
 third_party/
+
+# 離線跑機的依賴（見 tools/offline/README.md，刻意不進 repo）
+tools/offline/node_modules/
+tools/offline/opencv.js
+tools/offline/package.json
+tools/offline/package-lock.json
+
+# DETR fp32（166.8MB）超過 GitHub 單檔 100MB 上限，只留在本機做 A/B；
+# 實際使用與部署的是 fp16（83.8MB，實測準確度完全相同）
+models/detr-resnet-50.onnx
+
+# 測試素材與暫存模型（不進 repo）
+*.mp4
+models/*_tmp.onnx

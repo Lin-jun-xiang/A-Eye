@@ -129,6 +129,35 @@ export class FrontCarSelector {
         wgt *= Math.exp(-0.5 * Math.pow((over - 1) / p.ratioSoftness, 2));
       }
     }
+
+    // (c) 底邊被畫面裁掉的框：低側檢定（只有這種框才做）
+    //
+    // 為什麼一般情況不查低側：機車比汽車窄，w/Δy 天生偏低，查低側會誤殺它。
+    // 但底邊被畫面下緣裁掉是一個完全不同的狀況 —— 接地點在畫面外，
+    // 代表這個物體「至少有那麼近」，於是它的寬度有一個**下限**：
+    //
+    //   接地點恰在畫面最下緣時   Δy_max = vh − y_horizon
+    //   該距離下的車寬          w_min  = (W_car / h_cam) · Δy_max
+    //
+    // 焦距一樣在推導中消掉。實測這支影片（588x980、地平線 0.45）：
+    //   汽車 w_min = 809 px，機車（0.8m）w_min = 359 px —— 都比畫面 588 寬還大。
+    // 也就是說：**任何底邊被裁掉的真實車輛，都會寬到接近或超過整個畫面。**
+    // 一個貼著畫面下緣、卻只有兩三百 px 寬的框，在幾何上不可能站在地面上
+    // —— 那是方向盤、儀表板、A 柱反光這類黏在相機上的東西。
+    //
+    // 仍然做成軟性加權而不是硬性排除：地平線在沒有 IMU 時是 fallback 值，
+    // 估錯了會讓 w_min 整個偏掉，不該由它一票否決。
+    const clipped = (box.y + box.h) >= vh - p.bottomClipPx;
+    if (clipped) {
+      const f = this.cfg.frontCar;
+      const dyMax = vh - this.horizon * vh;
+      const wMin = (f.vehicleWidthM / Math.max(f.cameraHeightM, 0.1)) * dyMax;
+      // 容許實際寬度只有理論下限的 clippedWidthFactor 倍（地平線可能估偏）
+      const under = (wMin * p.clippedWidthFactor) / Math.max(box.w, 1);
+      if (under > 1) {
+        wgt *= Math.exp(-0.5 * Math.pow((under - 1) / p.clippedSoftness, 2));
+      }
+    }
     return wgt;
   }
 

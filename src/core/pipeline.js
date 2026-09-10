@@ -16,6 +16,7 @@ import { CONFIG } from '../config.js';
 import { iou } from '../util/math.js';
 import { Tracker } from '../tracking/tracker.js';
 import { OpticalFlow } from '../motion/opticalFlow.js';
+import { BboxScaleEstimator } from '../motion/bboxScale.js';
 import { DepartureDetector } from '../motion/departure.js';
 import { EgoMotionEstimator, EgoState } from '../motion/egoMotion.js';
 import { FrontCarSelector } from '../logic/frontCar.js';
@@ -30,6 +31,7 @@ export class Pipeline {
 
     this.tracker = new Tracker(cfg);
     this.flow = new OpticalFlow(cfg);
+    this.bboxScale = new BboxScaleEstimator(cfg);
     this.departure = new DepartureDetector(cfg);
     this.ego = new EgoMotionEstimator(cfg, gps, imu);
     this.frontCar = new FrontCarSelector(cfg);
@@ -45,6 +47,9 @@ export class Pipeline {
     this.lastFlow = null;
     this.lastFlowTs = 0;
     this.lastFlowMs = 0;
+    this.lastDetTs = 0;
+    this.detIntervalMs = 0;
+    this.brakeStale = false;
     this.lastLightTs = 0;
     this.lastBrakeTs = 0;
     // trackId -> { ms, everOn }：某個框被觀察了多久、期間有沒有出現過剎車燈。
@@ -59,7 +64,7 @@ export class Pipeline {
     this.lastTargetBox = null;
     this.lastTargetTs = 0;
     this.stats = {
-      ticks: 0, flowOk: 0, flowFail: {}, detections: 0,
+      ticks: 0, flowOk: 0, bboxOk: 0, flowFail: {}, detections: 0,
       targetTicks: 0, targetFresh: 0, targetChanges: 0, evidenceResets: 0,
     };
   }
@@ -71,6 +76,7 @@ export class Pipeline {
   reset() {
     this.tracker.reset();
     this.flow.reset();
+    this.bboxScale.reset();
     this.departure.reset();
     this.ego.reset();
     this.frontCar.reset();
@@ -80,13 +86,16 @@ export class Pipeline {
     this.lastBrakeTs = 0;
     this.lastFlow = null;
     this.lastFlowTs = 0;
+    this.lastDetTs = 0;
+    this.detIntervalMs = 0;
+    this.brakeStale = false;
     this.lastTickTs = 0;
     this.visEvidence = null;
     this.target = null;
     this.lastTargetBox = null;
     this.lastTargetTs = 0;
     this.stats = {
-      ticks: 0, flowOk: 0, flowFail: {}, detections: 0,
+      ticks: 0, flowOk: 0, bboxOk: 0, flowFail: {}, detections: 0,
       targetTicks: 0, targetFresh: 0, targetChanges: 0, evidenceResets: 0,
     };
   }
@@ -94,7 +103,25 @@ export class Pipeline {
   /** 偵測結果抵達（帶著它自己的影像時間戳，可能已延遲數百毫秒） */
   onDetections(boxes, ts) {
     this.stats.detections++;
+    // 實際的偵測間隔。`loop.detectHz` 只是**提交上限**，真正的節拍由推論速度
+    // 決定：models/yolov8n_384.onnx 不存在時會退回 640px 的模型，
+    // 實際節拍可能遠慢於設定的 8Hz。用設定值當「這個框新不新鮮」的門檻，
+    // 會讓每個框幾乎永遠是虛線，而「實線=觀測／虛線=預測」這個語意
+    // 是使用者唯一看得到的偵測健康度指標 —— 它必須量測，不能用設定值假裝。
+    if (this.lastDetTs) {
+      const gap = ts - this.lastDetTs;
+      if (gap > 0 && gap < 5000) {
+        this.detIntervalMs = this.detIntervalMs
+          ? 0.8 * this.detIntervalMs + 0.2 * gap : gap;
+      }
+    }
+    this.lastDetTs = ts;
     this.tracker.update(boxes, ts);
+  }
+
+  /** 框「還算新鮮」的上限（ms）：以實際量到的偵測間隔為準，設定值只當下限 */
+  get freshWindowMs() {
+    return 1.8 * Math.max(1000 / this.cfg.loop.detectHz, this.detIntervalMs || 0);
   }
 
   setFeatures({ car, light }) {
@@ -170,6 +197,7 @@ export class Pipeline {
         this.stats.evidenceResets++;
         this.departure.reset();
         this.flow.reset();
+        this.bboxScale.reset();
         this.brake.reset();
       }
       // 幾何上是同一台車 → 保留證據。光流的錨定 ROI 本來就會在目標
@@ -182,13 +210,19 @@ export class Pipeline {
     // 這個比例就是上面那條因果鏈的源頭，必須看得見。
     if (target) {
       this.stats.targetTicks++;
-      if (now - target.lastSeenTs <= 1.8 * (1000 / cfg.loop.detectHz)) this.stats.targetFresh++;
+      if (now - target.lastSeenTs <= this.freshWindowMs) this.stats.targetFresh++;
     }
 
     // ---- 3.5) 剎車燈（快路徑）----
     // 放在光流之前：它的結果會當成起步判定的先驗，而且比運動訊號早 0.3~1 秒。
     let brakeRes = null;
-    if (this.enableCarDepart && target) {
+    // 框不新鮮時**不要分析剎車燈**。左右燈區與車身參考區都是「bbox 的固定比例」，
+    // 而 KF 外推出來的框會漂（實測 0.16 個框高）—— 漂掉的框讓取樣區落在
+    // 車身甚至框外，於是一顆從頭亮到尾的燈被讀成熄滅，誤報「鬆開剎車」。
+    // 跳過而不是硬讀：狀態本來就有黏性，少一筆量測遠好過一筆錯的量測。
+    const targetFresh = !!target && now - target.lastSeenTs <= this.freshWindowMs;
+    this.brakeStale = !!target && !targetFresh;
+    if (this.enableCarDepart && target && targetFresh) {
       const gap = 1000 / cfg.brakeLight.hz;
       if (now - this.lastBrakeTs >= gap) {
         const dtMs = this.lastBrakeTs ? now - this.lastBrakeTs : gap;
@@ -215,22 +249,37 @@ export class Pipeline {
 
     // ---- 4) 光流 + 起步判定 ----
     let flowRes = null;
-    if (this.enableCarDepart && target && this.flow.cvReady) {
+    if (this.enableCarDepart && target) {
       const minGap = 1000 / cfg.loop.flowHz;
       if (now - this.lastFlowTs >= minGap) {
-        const box = target.boxAt(now);      // KF 預測到「現在」，不是幾百毫秒前的舊框
-        const tf0 = performance.now();
-        flowRes = this.flow.measure(source, box, vw, vh, now);
-        this.lastFlowMs = performance.now() - tf0;
+        if (this.flow.cvReady) {
+          const box = target.boxAt(now);    // KF 預測到「現在」，不是幾百毫秒前的舊框
+          const tf0 = performance.now();
+          flowRes = this.flow.measure(source, box, vw, vh, now);
+          this.lastFlowMs = performance.now() - tf0;
+          this.lastFlow = flowRes;
+        }
         this.lastFlowTs = now;
-        this.lastFlow = flowRes;
 
-        if (flowRes.ok) {
-          this.stats.flowOk++;
-          // 用量測自己的時間區間（不是「距上一幀」）積分陀螺儀，
-          // 才能和背景位移對得起來
-          this._crossCheckImu(flowRes, flowRes.t0, flowRes.t1);
-          const r = this.departure.update(flowRes, {
+        // ---- 第二條量測路徑：bbox 尺度變化率 ----
+        // 每個 tick 都餵樣本（它自己管不重疊的 600ms 窗口），
+        // 但**只有在光流這一 tick 沒產出量測時才採用它的結果** ——
+        // 同一 tick 送兩筆量測等於把同一份物理事實計入兩次證據，
+        // 那正是 v6 SPRT 的原始錯誤。
+        const bboxRes = this.bboxScale.update(target, now);
+        const useBbox = !(flowRes && flowRes.ok) && bboxRes.ok;
+        if (useBbox) this.stats.bboxOk++;
+
+        const meas = (flowRes && flowRes.ok) ? flowRes : (useBbox ? bboxRes : null);
+
+        if (meas) {
+          if (meas.source !== 'bbox') {
+            this.stats.flowOk++;
+            // 用量測自己的時間區間（不是「距上一幀」）積分陀螺儀，
+            // 才能和背景位移對得起來
+            this._crossCheckImu(meas, meas.t0, meas.t1);
+          }
+          const r = this.departure.update(meas, {
             ts: now,
             egoStill: canAlert,
             trusted: this.trusted,
@@ -240,7 +289,8 @@ export class Pipeline {
           });
           if (r.fired) events.push({ type: 'move', text: '🚗 前車已起步！', kind: 'depart' });
         } else {
-          this.stats.flowFail[flowRes.reason] = (this.stats.flowFail[flowRes.reason] || 0) + 1;
+          const reason = flowRes ? flowRes.reason : 'cv-not-ready';
+          this.stats.flowFail[reason] = (this.stats.flowFail[reason] || 0) + 1;
           this.departure.coast(now);
         }
       }
@@ -277,6 +327,7 @@ export class Pipeline {
         ego: this.ego.state,
         egoSource: this.ego.source,
         bgExpZ: this.visEvidence ? this.visEvidence.bgExpZ : null,
+        bgInvTtc: this.visEvidence ? this.visEvidence.bgInvTtc : null,
         egoLabel: this.ego.label,
         canAlert,
         assumeStill: this.assumeStill,
@@ -285,9 +336,11 @@ export class Pipeline {
         tracks: this.tracker.tracks.map((t) => ({
           id: t.id, classId: t.classId, box: t.boxAt(now),
           confirmed: t.confirmed, score: t.score,
-          // 「還沒被新的偵測更新」的門檻要跟偵測週期綁在一起。寫死 60ms 的話，
-          // detectHz=8（125ms 一次）會讓每個框幾乎永遠是虛線。
-          coasting: now - t.lastSeenTs > 1.8 * (1000 / cfg.loop.detectHz),
+          // 「還沒被新的偵測更新」的門檻要跟**實際量到的**偵測週期綁在一起。
+          // 寫死 60ms 會讓每個框永遠是虛線；用設定的 detectHz 也一樣 ——
+          // 推論比 8Hz 慢的時候（384 模型不存在、退回 640px 就是這種情形），
+          // 每個框還是永遠虛線，等於這個指示燈壞掉。
+          coasting: now - t.lastSeenTs > this.freshWindowMs,
         })),
         horizon: this.frontCar.horizon,
         laneCenterX: this.frontCar.laneCenterX,
@@ -298,6 +351,8 @@ export class Pipeline {
         brakeState: this.brake.state,
         brakePrimed: this.brake.primed(now),
         brakeDetail: this.brake.lastDetail,
+        brakeStale: this.brakeStale,
+        detIntervalMs: this.detIntervalMs,
         brakeCfg: cfg.brakeLight,
         // 判定「熄滅」靠的是「位準 / 峰值」這個比值，所以峰值與門檻要一起給 UI
         // 第三剎車燈：可用時它就是權威判據（落差 70 倍 vs 外側燈的 1.5 倍）
@@ -351,7 +406,11 @@ export class Pipeline {
     const bgExpZ = (bg && bg.sigmaS > 0 && isFinite(bg.sigmaS))
       ? Math.log(bg.s) * bg.s / bg.sigmaS
       : null;
-    this.visEvidence = { resid: null, bgExpZ };
+    // z 只說「這個變化在統計上顯著嗎」，不說「它在物理上大不大」。
+    // σ_s 是近百個背景點的標準誤，小到 3e-4 —— 站著不動也能量出 8σ。
+    // 所以同時把物理量（背景的 1/TTC，1/秒）算出來給 ego 判定用。
+    const bgInvTtc = (bg && flowRes.dt > 0) ? -Math.log(bg.s) / flowRes.dt : null;
+    this.visEvidence = { resid: null, bgExpZ, bgInvTtc };
 
     if (!this.imu || !this.imu.hasGyro) return;
 
@@ -420,7 +479,8 @@ export class Pipeline {
     l.push(`target 新鮮 ${st.targetTicks ? (st.targetFresh / st.targetTicks * 100).toFixed(0) : '--'}%`
       + ` 換手 ${st.targetChanges} 次（其中清空證據 ${st.evidenceResets} 次）`);
     const ts2 = this.tracker.stats;
-    l.push(`偵測框 ${ts2.dets} 個 → 配對 ${ts2.matched} 新建 ${ts2.created} 淘汰 ${ts2.dropped}`);
+    l.push(`高分框 ${ts2.dets} → 配對 ${ts2.matched} 新建 ${ts2.created} 淘汰 ${ts2.dropped}`
+      + `｜低分框 ${ts2.detsLow} → 救回 ${ts2.recoveredLow}`);
     l.push(this.departure.debugLine());
     l.push(this.brake.debugLine());
     if (this.lastFlow) {
@@ -430,9 +490,12 @@ export class Pipeline {
           + ` sRel=${f.sRel.toFixed(5)}±${f.sigmaRel.toExponential(1)} dy=${f.dyRel.toFixed(2)}`
         : `flow FAIL: ${f.reason}`);
     }
+    l.push(this.bboxScale.debugLine() + ` 採用 ${this.stats.bboxOk} 筆`);
     const bz = this.visEvidence && this.visEvidence.bgExpZ;
+    const bv = this.visEvidence && this.visEvidence.bgInvTtc;
     l.push(`bgExpZ=${bz === null || bz === undefined ? '--' : bz.toFixed(1)}`
-      + `（|z|<${this.cfg.ego.visualStaticZ} → 自車視覺上靜止）`);
+      + ` bg1/TTC=${bv === null || bv === undefined ? '--' : bv.toFixed(3)}`
+      + `（要 |z|>${this.cfg.ego.visualStaticZ} 且 |1/TTC|>${this.cfg.ego.visualStaticInvTtc} 才算行駛中）`);
     l.push(`imu cal=${this.imu?.calibrated ? 'Y' : 'N'} q=${(this.imu?.calibX.quality || 0).toFixed(2)}`
       + ` disagree=${this.imuDisagree.toFixed(1)}σ trusted=${this.trusted ? 'Y' : 'N'}`);
     l.push(this.light.debugLine());

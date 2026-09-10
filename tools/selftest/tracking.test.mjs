@@ -391,5 +391,44 @@ console.log('=== 過期的大框不該贏過新鮮的小框 ===');
 }
 
 console.log('');
+console.log('=== 方向盤／儀表板：底邊貼著畫面下緣，但寬度遠不足 ===');
+// 2026-09-10 實測：面板上 egoRegions=0 —— 自車結構黑名單只在「自車行駛中」
+// 學習，停等紅燈時結構上學不到，而那正是引擎蓋/方向盤擋住視野的時候。
+// 幾何加權原本又只查「高側」離群，方向盤在直式畫面裡 Δy 很大、
+// 比值反而偏低，一分都沒扣。
+//
+// 但「底邊被畫面裁掉」是一個有下限的狀況：接地點在畫面外 → 至少那麼近 →
+//   w_min = (W_car/h_cam)·(vh − y_horizon)     （焦距消掉）
+// 588x980、地平線 0.45 → 汽車 809px、機車 359px，都比畫面 588 還寬。
+// 所以「貼著下緣卻只有兩三百 px 寬」在幾何上不可能是站在地面上的車。
+{
+  const sel = new FrontCarSelector(CONFIG);
+  const VW = 588, VH = 980;
+  for (let i = 0; i < 60; i++) sel.setHorizon(0.45);      // 讓 EMA 收斂
+  const dyMax = VH - sel.horizon * VH;
+  const wMin = (CONFIG.frontCar.vehicleWidthM / CONFIG.frontCar.cameraHeightM) * dyMax;
+  console.log(`  地平線 ${sel.horizon.toFixed(3)} → Δy_max ${dyMax.toFixed(0)}px`
+    + `、真實車輛的寬度下限 ${wMin.toFixed(0)}px（畫面只有 ${VW}px 寬）`);
+
+  const wheel = { x: 150, y: VH - 190, w: 260, h: 190 };   // 方向盤：貼著下緣、又窄又矮
+  const car = { x: 190, y: 560, w: 210, h: 170 };          // 8m 外的真前車
+  const moto = { x: 60, y: 700, w: 90, h: 150 };           // 機車：底邊沒被裁掉
+  const pw = sel.plausibility(wheel, VW, VH);
+  const pc = sel.plausibility(car, VW, VH);
+  const pm = sel.plausibility(moto, VW, VH);
+  console.log(`  方向盤 ${wheel.w}x${wheel.h} 底邊 y=${wheel.y + wheel.h} → plaus=${pw.toFixed(3)}`);
+  ok('方向盤框的幾何可信度被明顯扣分', pw < 0.4, `plaus=${pw.toFixed(3)}`);
+  ok('8m 外的真前車不受影響', pc > 0.9, `plaus=${pc.toFixed(3)}`);
+  ok('底邊未裁切的窄框（機車）不受這條規則影響', pm > 0.9, `plaus=${pm.toFixed(3)}`);
+
+  const prox = (b) => Math.max(0, Math.min(1,
+    ((b.y + b.h) / VH - sel.horizon) / (1 - sel.horizon)));
+  const sWheel = prox(wheel) * pw, sCar = prox(car) * pc;
+  console.log(`  分數：方向盤 ${prox(wheel).toFixed(2)}x${pw.toFixed(2)}=${sWheel.toFixed(3)}`
+    + `　真前車 ${prox(car).toFixed(2)}x${pc.toFixed(2)}=${sCar.toFixed(3)}`);
+  ok('真前車勝出（即使方向盤的 proximity 是滿分）', sCar > sWheel);
+}
+
+console.log('');
 console.log(failCount ? `❌ ${failCount} 項未通過` : '✅ 全部通過');
 if (failCount) process.exitCode = 1;

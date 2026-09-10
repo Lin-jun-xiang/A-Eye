@@ -83,6 +83,9 @@ export function areaAboveFromHist(hist, n, theta) {
   return c / n;
 }
 
+/** 預設幾何：裁切圖就是 bbox 本身（沒有往上多留邊） */
+export const FULL_BOX = { yOff: 0, yScale: 1 };
+
 /**
  * 純函式：從 RGBA 像素算出三個區域的紅度統計。
  * 不接觸任何 DOM，所以可以在 node 裡用合成影像做單元測試
@@ -91,16 +94,20 @@ export function areaAboveFromHist(hist, n, theta) {
  * @param data RGBA Uint8ClampedArray（長度 = w·h·4）
  * @returns { left, right, body, overexposed, luma, n }
  */
-export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
-  const y0 = Math.max(0, Math.round(h * cfg.yTop));
-  const y1 = Math.min(h, Math.max(y0 + 1, Math.round(h * cfg.yBottom)));
+export function lampStats(data, w, h, cfg = CONFIG.brakeLight, geom = FULL_BOX) {
+  // geom 描述「原始 bbox 在這張裁切圖裡的垂直位置」。裁切圖可以比 bbox 高
+  // （往上多留一段給第三剎車燈，見 chmslGrid 的說明），所有既有的
+  // 「bbox 高度比例」都必須先經過這個映射才會落在正確的像素列上。
+  const Y = (f) => (geom.yOff + f * geom.yScale) * h;
+  const y0 = Math.max(0, Math.round(Y(cfg.yTop)));
+  const y1 = Math.min(h, Math.max(y0 + 1, Math.round(Y(cfg.yBottom))));
   const sw = Math.max(1, Math.round(w * cfg.sideFrac));
   const cw = Math.max(1, Math.round(w * cfg.centerFrac));
   const cx0 = Math.max(0, Math.round((w - cw) / 2));
 
   // 車身參考區用「燈帶以下」的中央 —— 必須避開位於車後中線的第三剎車燈
-  const by0 = Math.max(0, Math.round(h * cfg.bodyYTop));
-  const by1 = Math.min(h, Math.max(by0 + 1, Math.round(h * cfg.bodyYBottom)));
+  const by0 = Math.max(0, Math.round(Y(cfg.bodyYTop)));
+  const by1 = Math.min(h, Math.max(by0 + 1, Math.round(Y(cfg.bodyYBottom))));
   const hl = roiHist(data, w, 0, sw, y0, y1);
   const hr = roiHist(data, w, w - sw, w, y0, y1);
   const hb = roiHist(data, w, cx0, cx0 + cw, by0, by1);
@@ -127,7 +134,7 @@ export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
     // 直方圖交給 BrakeLightDetector 算「面積」—— 門檻 θ 取決於它保存的
     // 燈芯亮度峰值，那是跨 tick 的狀態，不屬於這個純函式
     histL: hl.hist, histR: hr.hist, nL: hl.n, nR: hr.n,
-    chGrid: chmslGrid(data, w, h, cfg),
+    chGrid: chmslGrid(data, w, h, cfg, geom),
     overexposed: tot > 0 ? over / tot : 0,
     luma: nAll > 0 ? luma / nAll : 0,
     n: nAll,
@@ -146,11 +153,14 @@ export function lampStats(data, w, h, cfg = CONFIG.brakeLight) {
  * 回傳的是原始網格，判定留給 BrakeLightDetector —— 因為那需要跨 tick 的
  * 位置追蹤與峰值/谷值，不屬於純函式。
  */
-export function chmslGrid(data, w, h, cfg = CONFIG.brakeLight) {
+export function chmslGrid(data, w, h, cfg = CONFIG.brakeLight, geom = FULL_BOX) {
   const c = cfg.chmsl;
   const x0 = Math.max(0, Math.round(w * (0.5 - c.searchXFrac / 2)));
   const x1 = Math.min(w, Math.round(w * (0.5 + c.searchXFrac / 2)));
-  const y1 = Math.min(h, Math.max(2, Math.round(h * c.searchYFrac)));
+  // 搜尋帶的下緣仍然是「bbox 上緣 40%」，但上緣一路吃到裁切圖的頂端 ——
+  // 裁切時已經在 bbox 之上多留了 topMarginFrac，因為第三剎車燈就長在
+  // 車頂線上，而 YOLO 的框上緣「就是」車頂線，兩者沒有任何餘裕。
+  const y1 = Math.min(h, Math.max(2, Math.round((geom.yOff + c.searchYFrac * geom.yScale) * h)));
   const vals = new Float32Array(c.cols * c.rows);
   for (let ry = 0; ry < c.rows; ry++) {
     const cy0 = Math.round(y1 * ry / c.rows), cy1 = Math.round(y1 * (ry + 1) / c.rows);
@@ -213,7 +223,9 @@ export class BrakeLightDetector {
     this.resolved = false;   // 動態範圍是否已足以區分尾燈與剎車燈
 
     // ---- 第三剎車燈（車頂中央那一顆）----
-    this.chPos = null;            // 追蹤到的位置（bbox 內的正規化座標）
+    this.chPos = null;            // 追蹤到的位置（裁切圖內的正規化座標）
+    this.chPosImg = null;         // 同一個位置的**影像座標** —— 這才是權威的那份，
+                                  // chPos 每個 tick 由它與當前裁切矩形重新換算
     this.chPeak = 0;              // 這顆燈自己的亮度峰值
     this.chFloor = Infinity;      // 與谷值 —— 兩者的比值決定「能不能信」
     this.chVal = 0;
@@ -256,7 +268,7 @@ export class BrakeLightDetector {
    *    之後一律讀「追蹤位置上的值」而不是「網格最大值」——
    *    否則背景其他車的紅燈飄進搜尋區就會被誤認。
    */
-  _updateChmsl(st, now, boxW) {
+  _updateChmsl(st, now, boxW, crop = null) {
     const c = this.cfg.brakeLight.chmsl;
     const g = st.chGrid;
     const out = { usable: false, state: 'unknown', pressed: false, released: false, val: 0 };
@@ -286,28 +298,59 @@ export class BrakeLightDetector {
     // 這一關只管「要不要更新追蹤位置」，寧嚴勿寬 —— 鎖錯位置的代價很高。
     const looksLit = mv >= Math.max(c.litVsGrid * med, c.litMin);
 
-    // 追蹤位置上的目前值
+    // ---- 追蹤位置存在「影像座標」裡，不是 bbox 正規化座標 ----
+    // 這是 2026-09-10 那支錄影逼出來的：燈在車上不動，但 bbox 會抖、
+    // 而且沒有新偵測時是 KF 外推出來的，實測會整個往下漂 0.16 個框高。
+    // 把位置存成 bbox 的比例，等於把框的誤差直接加到燈的位置上；
+    // 存成影像座標，框怎麼漂都不影響取樣點落在哪顆燈上。
+    if (crop && this.chPosImg) {
+      this.chPos = {
+        x: (this.chPosImg.x - crop.x) / crop.w,
+        y: (this.chPosImg.y - crop.y) / crop.h,
+      };
+      // 已經跑出裁切圖 → 這個鎖定沒有意義了，放掉重找
+      if (this.chPos.x < 0 || this.chPos.x > 1 || this.chPos.y < 0 || this.chPos.y > 1) {
+        this.chPos = null; this.chPosImg = null;
+      }
+    }
+    const remember = (pos) => {
+      if (crop) this.chPosImg = { x: crop.x + pos.x * crop.w, y: crop.y + pos.y * crop.h };
+    };
+
+    // 讀「追蹤位置」的值時取 ±readRadius 格的最大值，不是單一格。
+    // 一格只有 bbox 寬的 2.2%（實測約 5px），次格級的誤差就足以整個讀空。
+    const rad = c.readRadius | 0;
     const readAt = (pos) => {
-      const rx = Math.min(g.cols - 1, Math.max(0,
+      const cx = Math.min(g.cols - 1, Math.max(0,
         Math.round((pos.x - g.xOff) / g.cellW - 0.5)));
-      const ry = Math.min(g.rows - 1, Math.max(0,
+      const cy = Math.min(g.rows - 1, Math.max(0,
         Math.round(pos.y / g.cellH - 0.5)));
-      return g.vals[ry * g.cols + rx];
+      let mx = 0;
+      for (let ry = Math.max(0, cy - rad); ry <= Math.min(g.rows - 1, cy + rad); ry++) {
+        for (let rx = Math.max(0, cx - rad); rx <= Math.min(g.cols - 1, cx + rad); rx++) {
+          const v = g.vals[ry * g.cols + rx];
+          if (v > mx) mx = v;
+        }
+      }
+      return mx;
     };
 
     // ---- 位置追蹤 ----
     if (looksLit) {
       if (!this.chPos) {
         this.chPos = { x: cand.x, y: cand.y };
+        remember(this.chPos);
       } else if (Math.abs(cand.x - this.chPos.x) <= c.posTol) {
         // 就在追蹤位置附近 → 微調（燈在車上不動，位置本身就是一道驗證）
         this.chPos.x = 0.8 * this.chPos.x + 0.2 * cand.x;
         this.chPos.y = 0.8 * this.chPos.y + 0.2 * cand.y;
+        remember(this.chPos);
       } else if (mv >= c.relockRatio * Math.max(readAt(this.chPos), 1)) {
         // 別處出現明顯更強的候選 → 重新鎖定。
         // 這是唯一的恢復路徑：實測曾在第三燈還沒亮時把位置鎖到尾燈上，
         // 之後真正的燈亮起也讀不到，因為它離追蹤位置太遠。
         this.chPos = { x: cand.x, y: cand.y };
+        remember(this.chPos);
         this.chPeak = 0;
         this.chFloor = Infinity;
         this.chState = 'unknown';
@@ -371,29 +414,45 @@ export class BrakeLightDetector {
       this.lastDetail = 'too-small';
       return { state: 'unknown', released: false, usable: false };
     }
+    // ---- 裁切範圍要比 bbox 往上多留一段 ----
+    // 第三剎車燈長在車頂線上，而 YOLO 的框上緣「就是」車頂線 ——
+    // 兩者重疊在同一條線上，完全沒有餘裕。實測（2026-09-10 夜間錄影）
+    // 框只要往下漂 0.16 個框高，這顆燈就整個掉出裁切範圍，
+    // 網格讀到純車身 → 判成熄滅 → 誤報「鬆開剎車」。
+    const margin = Math.max(0, b.chmsl.topMarginFrac || 0) * box.h;
+    let sy = box.y - margin;
+    if (sy < 0) sy = 0;                       // 夾在畫面內，避免 canvas 的邊界行為
+    const sh = box.h + (box.y - sy);
+    // 縮放倍率仍以「原始 bbox」為準，不含上方多留的那一段 ——
+    // 否則多留邊會連帶把分析解析度降低，燈的網格格子跟著變小
     const scale = Math.min(1, b.maxSide / Math.max(box.w, box.h));
     const w = Math.max(8, Math.round(box.w * scale));
-    const h = Math.max(8, Math.round(box.h * scale));
+    const h = Math.max(8, Math.round(sh * scale));
     this.canvas.width = w;
     this.canvas.height = h;
     let img;
     try {
-      this.ctx.drawImage(source, box.x, box.y, box.w, box.h, 0, 0, w, h);
+      this.ctx.drawImage(source, box.x, sy, box.w, sh, 0, 0, w, h);
       img = this.ctx.getImageData(0, 0, w, h);
     } catch (e) {
       this.lastDetail = 'capture-fail';
       return { state: 'unknown', released: false, usable: false };
     }
+    // 原始 bbox 在這張裁切圖裡的垂直位置 —— 所有既有的比例都用它換算
+    const geom = { yOff: (box.y - sy) / sh, yScale: box.h / sh };
+    // 裁切矩形（影像座標）—— 第三剎車燈的位置追蹤要在影像座標裡做，
+    // 不能用 bbox 正規化座標，否則框一抖位置就跟著跑掉
+    const crop = { x: box.x, y: sy, w: box.w, h: sh };
     // boxW 用「影像座標」的框寬，不是裁切後的 —— 它是距離的代理，
     // 而裁切寬度被 maxSide 夾住之後就失去了距離資訊
-    return this.updateFromStats(lampStats(img.data, w, h, b), now, box.w);
+    return this.updateFromStats(lampStats(img.data, w, h, b, geom), now, box.w, crop);
   }
 
   /**
    * 純判定：吃 lampStats 的輸出，輸出狀態與「剛剛熄滅」的邊緣事件。
    * 這裡沒有任何 DOM，也沒有任何絕對像素門檻 —— 全部是比值。
    */
-  updateFromStats(st, now, boxW = Infinity) {
+  updateFromStats(st, now, boxW = Infinity, crop = null) {
     const b = this.cfg.brakeLight;
     this.lastStats = st;
 
@@ -423,7 +482,7 @@ export class BrakeLightDetector {
 
     // ---- 第三剎車燈（優先）----
     // 放在過曝檢查之後：全白的畫面會讓網格紅度歸零，看起來像「熄滅」
-    const ch = this._updateChmsl(st, now, boxW);
+    const ch = this._updateChmsl(st, now, boxW, crop);
     this.chUsable = ch.usable;
 
     // ---- 三個量，各有明確的分工 ----

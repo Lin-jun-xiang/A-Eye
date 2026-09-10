@@ -128,7 +128,9 @@ export class NodeDetector {
     const scale = Math.min(S / img.width, S / img.height);
     const nw = Math.round(img.width * scale), nh = Math.round(img.height * scale);
     const dx = Math.round((S - nw) / 2), dy = Math.round((S - nh) / 2);
-    const t = new Float32Array(3 * n);
+    // 與 detector.worker.js 一致：letterbox 填充色是灰 114（Ultralytics 的訓練值），
+    // 不是黑。兩邊不一致的話，離線跑機量到的就不是 app 的行為。
+    const t = new Float32Array(3 * n).fill(114 / 255);
     for (let y = 0; y < nh; y++) {
       const sy = Math.min(img.height - 1, Math.round(y / scale));
       for (let x = 0; x < nw; x++) {
@@ -151,7 +153,7 @@ export class NodeDetector {
         const sc = data[(4 + c) * numDet + i];
         if (sc > best) { best = sc; bestCls = c; }
       }
-      if (bestCls < 0 || best < y.confThreshold) continue;
+      if (bestCls < 0 || best < Math.min(y.confLow ?? y.confThreshold, y.confThreshold)) continue;
       const cx = data[i], cy = data[numDet + i];
       const w = data[2 * numDet + i], h = data[3 * numDet + i];
       let x = (cx - w / 2 - geo.dx) / geo.scale, yy = (cy - h / 2 - geo.dy) / geo.scale;
@@ -182,6 +184,67 @@ export class NodeDetector {
       }
     }
     return keep;
+  }
+}
+
+// ---------- 3b) DETR 偵測器（與 detector.worker.js 的解碼完全同一套規則）----------
+// 分成兩個 class 而不是塞 if：兩者的前處理、輸出格式、類別編碼都不同，
+// 但**對外的契約一樣**（回傳 app 內部 COCO-80 類別 id 的框），
+// 所以 run.mjs 換一行就能比較兩個家族。
+export class DetrDetector {
+  constructor(cfg, modelPath, ort) { this.cfg = cfg; this.modelPath = modelPath; this.ort = ort; }
+  async init() {
+    this.sess = await this.ort.InferenceSession.create(this.modelPath);
+    const d = this.cfg.detr;
+    this.mask = new this.ort.Tensor('int64',
+      new BigInt64Array(d.maskSize * d.maskSize).fill(1n), [1, d.maskSize, d.maskSize]);
+    return { model: this.modelPath.split(/[\/]/).pop(), provider: 'node-cpu', inputSize: d.shortSide };
+  }
+  async detect(img) {
+    const d = this.cfg.detr;
+    const sc = d.shortSide / Math.min(img.width, img.height);
+    const nw = Math.round(img.width * sc), nh = Math.round(img.height * sc);
+    const n = nw * nh, t = new Float32Array(3 * n);
+    for (let y = 0; y < nh; y++) {
+      const sy = Math.min(img.height - 1, Math.round(y / sc));
+      for (let x = 0; x < nw; x++) {
+        const sx = Math.min(img.width - 1, Math.round(x / sc));
+        const si = (sy * img.width + sx) * 4, di = y * nw + x;
+        t[di]         = (img.data[si]     / 255 - d.mean[0]) / d.std[0];
+        t[n + di]     = (img.data[si + 1] / 255 - d.mean[1]) / d.std[1];
+        t[2 * n + di] = (img.data[si + 2] / 255 - d.mean[2]) / d.std[2];
+      }
+    }
+    const out = await this.sess.run({
+      pixel_values: new this.ort.Tensor('float32', t, [1, 3, nh, nw]),
+      pixel_mask: this.mask,
+    });
+    const lg = out.logits, bx = out.pred_boxes;
+    const Q = lg.dims[1], C = lg.dims[2], boxes = [];
+    for (let q = 0; q < Q; q++) {
+      const off = q * C;
+      let mx = -Infinity;
+      for (let c = 0; c < C; c++) { const v = lg.data[off + c]; if (v > mx) mx = v; }
+      let sum = 0;
+      for (let c = 0; c < C; c++) sum += Math.exp(lg.data[off + c] - mx);
+      let best = -1, bs = 0;
+      for (let c = 0; c < C - 1; c++) {       // 最後一類是「無物件」
+        const pr = Math.exp(lg.data[off + c] - mx) / sum;
+        if (pr > bs) { bs = pr; best = c; }
+      }
+      const mapped = d.classMap[best];
+      if (mapped === undefined || bs < d.confThreshold) continue;
+      const cx = bx.data[q * 4] * img.width, cy = bx.data[q * 4 + 1] * img.height;
+      let bw = bx.data[q * 4 + 2] * img.width, bh = bx.data[q * 4 + 3] * img.height;
+      let x = cx - bw / 2, y = cy - bh / 2;
+      if (x < 0) { bw += x; x = 0; }
+      if (y < 0) { bh += y; y = 0; }
+      if (x + bw > img.width) bw = img.width - x;
+      if (y + bh > img.height) bh = img.height - y;
+      if (bw <= 1 || bh <= 1) continue;
+      boxes.push({ x, y, w: bw, h: bh, score: bs, classId: mapped });
+    }
+    return boxes;                              // 集合預測 → 不需要 NMS
   }
 }
 

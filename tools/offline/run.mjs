@@ -3,7 +3,7 @@
 // 用法（見 README.md）：
 //   ffmpeg -v error -i in.mp4 -ss 148 -t 18 -vf "fps=10,crop=588:940:0:0" \
 //     -pix_fmt rgba -f rawvideo pipe:1 | node run.mjs 588 940 10 148
-import { installShims, loadCv, NodeDetector, frameReader } from './harness.mjs';
+import { installShims, loadCv, NodeDetector, DetrDetector, frameReader } from './harness.mjs';
 import { createRequire } from 'module';
 import { CONFIG } from '../../src/config.js';
 import { Pipeline } from '../../src/core/pipeline.js';
@@ -16,14 +16,22 @@ if (!W || !H || !fps) {
 }
 const FRAME = W * H * 4;
 const CV = process.env.CV_JS || new URL('./opencv.js', import.meta.url).pathname.replace(/^\//, '');
-const MODEL = process.env.MODEL || new URL('../../models/yolov8n.onnx', import.meta.url).pathname.replace(/^\//, '');
+// 預設與 config.js 的 modelCandidates[0] 一致，否則跑機量到的不是 app 的行為
+const MODEL = process.env.MODEL || new URL('../../models/yolov8s.onnx', import.meta.url).pathname.replace(/^\//, '');
 
 installShims();
 process.stderr.write('載入 opencv.js...\n');
 await loadCv(CV);
 process.stderr.write('載入模型...\n');
 const ort = require_('onnxruntime-node');
-const det = new NodeDetector(CONFIG, MODEL, ort);
+// MODEL=... 指定模型；FAMILY=detr 換成 DETR 那條解碼路徑
+// （預設由 config.js 的 detector.family 決定，與 app 一致）
+const FAMILY = process.env.FAMILY || CONFIG.detector.family;
+if (FAMILY === 'detr') CONFIG.detector.family = 'detr';
+const det = FAMILY === 'detr'
+  ? new DetrDetector(CONFIG, process.env.MODEL
+      || new URL('../../models/detr-resnet-50-fp16.onnx', import.meta.url).pathname.replace(/^\//, ''), ort)
+  : new NodeDetector(CONFIG, MODEL, ort);
 const info = await det.init();
 process.stderr.write(`模型 ${info.model} @${info.provider} ${info.inputSize}px\n`);
 
@@ -62,6 +70,7 @@ for (;;) {
       + `  z=${d.z.toFixed(2)}/${d.zFire.toFixed(2)} LLR=${d.llr.toFixed(1)}/${d.sprtA.toFixed(1)}`
       + ` V=${d.V.toFixed(3)} n=${d.ticks} ${d.reason}`
       + `  flow=${fl ? (fl.ok ? `ok fg=${fl.fg.nIn}/${fl.fg.n} bg=${fl.bg.nIn}/${fl.bg.n}` : fl.reason) : '--'}`
+      + `  bbox=${pipeline.bboxScale.lastReason}`
       + `  剎車燈=${hud.brakeState}${hud.brakeChmslUsable ? `(第三燈${hud.brakeChmslState})` : ''}`);
   }
   f++;
@@ -70,10 +79,12 @@ for (;;) {
 const st = pipeline.stats, tk = pipeline.tracker.stats;
 console.log('\n===== 總結 =====');
 console.log(`幀數 ${f}（${t0.toFixed(0)}~${(t0 + (f - 1) / fps).toFixed(1)}s @${fps}fps）`);
-console.log(`偵測 ${st.detections} 次，偵測框 ${tk.dets} 個 → 配對 ${tk.matched} 新建 ${tk.created} 淘汰 ${tk.dropped}`);
+console.log(`偵測 ${st.detections} 次，高分框 ${tk.dets} 個 → 配對 ${tk.matched} 新建 ${tk.created} 淘汰 ${tk.dropped}`);
+console.log(`低分框 ${tk.detsLow} 個 → BYTE 第二段救回 ${tk.recoveredLow}`);
 console.log(`目標新鮮 ${st.targetTicks ? (st.targetFresh / st.targetTicks * 100).toFixed(0) : '--'}%`
   + `（${st.targetFresh}/${st.targetTicks}）　換手 ${st.targetChanges} 次（清空證據 ${st.evidenceResets} 次）`);
 const fails = Object.entries(st.flowFail || {}).sort((a, b) => b[1] - a[1]);
 console.log(`光流 ok ${st.flowOk}　失敗：${fails.map(([k, v]) => `${k}:${v}`).join(' ') || '無'}`);
+console.log(`bbox 尺度量測（光流交白卷時的第二條路）${st.bboxOk} 筆`);
 console.log(`事件 ${events.length} 個：`);
 for (const e of events) console.log(`   ${e.t.toFixed(2)}s  ${e.text}`);

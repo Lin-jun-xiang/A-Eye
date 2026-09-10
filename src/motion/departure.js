@@ -107,7 +107,18 @@ export class DepartureDetector {
     const primed = !!ctx.primed;
 
     if (!ctx.egoStill) {
-      this.reset();
+      // **coast 而不是 reset。**
+      // 自車狀態是逐 tick 判定的，會抖 —— 2026-09-10 實測 18 秒內
+      // still/moving 來回跳 17 次，而每一次 moving 都把證據整個歸零：
+      //   t=48s  n=7 LLR=6.2  →  t=49s  n=0（一個 tick 就全沒了）
+      //   t=57s  n=5 LLR=7.5  →  t=58s  n=0
+      // 這是這個檔案裡最後一處硬歸零，而其他地方早就改成 coast 了
+      //（「短暫漏檢不該清空證據」）。
+      //
+      // 安全性不受影響：**擋住觸發的是 canAlert，不是清空證據**。
+      // 自車真的在動時，這裡收不到任何量測，coast() 會在 coastMs(700ms)
+      // 之後自己 reset —— 持續行駛照樣歸零，只是不再被單一雜訊 tick 毀掉。
+      this.coast(ts);
       this.lastReason = 'ego-moving';
       return { fired: false, status: this.status(ts) };
     }
@@ -234,7 +245,12 @@ export class DepartureDetector {
 
   status(ts, extra = {}) {
     const ttc = this.V > 1e-4 ? 1 / this.V : Infinity;
+    // 佐證投票的比例要「一直看得見」，不能只在有量測的那一 tick 才有值 ——
+    // 2026-09-10 那次就是卡在這道閘門，而面板上完全看不到它的狀態。
+    const upN = this.upBuf.length;
+    const upRatio = upN >= 3 ? this.upBuf.reduce((a, b) => a + b, 0) / upN : null;
     return {
+      upRatio, upVotes: upN,
       V: this.V,
       sigmaV: Math.sqrt(Math.max(this.Vvar, 0)),
       z: this.lastZ,
@@ -255,6 +271,8 @@ export class DepartureDetector {
     const s = this.status(performance.now());
     const ttc = isFinite(s.ttc) ? s.ttc.toFixed(1) + 's' : '--';
     return `V=${s.V.toFixed(3)}±${s.sigmaV.toFixed(3)} z=${s.z.toFixed(2)}/${s.zFire.toFixed(2)}`
-      + ` LLR=${s.llr.toFixed(2)}/${s.sprtA.toFixed(2)} TTC=${ttc} n=${s.ticks} ${s.reason}`;
+      + ` LLR=${s.llr.toFixed(2)}/${s.sprtA.toFixed(2)} TTC=${ttc} n=${s.ticks}`
+      + ` up=${s.upRatio === null ? '--' : s.upRatio.toFixed(2)}/${this.cfg.departure.upwardAgreeRatio}`
+      + `(${s.upVotes}) ${s.reason}`;
   }
 }

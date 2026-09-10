@@ -4,7 +4,7 @@
 // stale-while-revalidate 很容易讓不同版本的模組混在一起（極難除錯）。
 // 離線時才回退到快取。
 
-const CACHE = 'aeye-v11';
+const CACHE = 'aeye-v12';
 
 const FILES = [
   './',
@@ -26,6 +26,7 @@ const FILES = [
   './src/tracking/kalmanBox.js',
   './src/tracking/tracker.js',
   './src/motion/opticalFlow.js',
+  './src/motion/bboxScale.js',
   './src/motion/departure.js',
   './src/motion/egoMotion.js',
   './src/logic/frontCar.js',
