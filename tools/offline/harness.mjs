@@ -244,7 +244,21 @@ export class DetrDetector {
       if (bw <= 1 || bh <= 1) continue;
       boxes.push({ x, y, w: bw, h: bh, score: bs, classId: mapped });
     }
-    return boxes;                              // 集合預測 → 不需要 NMS
+    // 與 detector.worker.js 的 decodeDetr 同一條規則：不做跨物件 NMS，
+    // 但去掉同類近重複框（同一台車兩個幾乎一樣的框會讓追蹤器建平行軌跡）
+    boxes.sort((a, b) => b.score - a.score);
+    const keep = [];
+    const iou = (a, b) => {
+      const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+      const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+      const iw = x2 - x1, ih = y2 - y1;
+      if (iw <= 0 || ih <= 0) return 0;
+      return iw * ih / (a.w * a.h + b.w * b.h - iw * ih);
+    };
+    for (const b of boxes) {
+      if (!keep.some((k) => k.classId === b.classId && iou(k, b) > d.dedupIou)) keep.push(b);
+    }
+    return keep;
   }
 }
 

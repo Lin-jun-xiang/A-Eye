@@ -45,6 +45,23 @@ export class Overlay {
     return [this.map.dx + x * this.map.scale, this.map.dy + y * this.map.scale];
   }
 
+  /**
+   * 螢幕座標（clientX/Y）→ 影像座標。手動鎖定的點按用。
+   * 是 _pt 的反函數，共用同一份 map —— object-fit 的裁切/留邊
+   * 只在這一個地方定義，兩個方向才不會不一致。
+   */
+  toVideoXY(clientX, clientY) {
+    if (!this.map) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = this.canvas.width / Math.max(rect.width, 1);
+    const cx = (clientX - rect.left) * dpr;
+    const cy = (clientY - rect.top) * dpr;
+    return {
+      x: (cx - this.map.dx) / this.map.scale,
+      y: (cy - this.map.dy) / this.map.scale,
+    };
+  }
+
   clear() { this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height); }
 
   draw(hud, vw, vh, { debug = false } = {}) {
@@ -70,8 +87,8 @@ export class Overlay {
         width: isTarget ? 4 : 1.5,
         dash: t.coasting ? [6, 4] : null,
         label: debug
-          ? `#${t.id} ${CLASS_NAME[t.classId] || t.classId} ${(t.score * 100) | 0}%`
-          : null,
+          ? `${hud.pinnedId === t.id ? '📌' : ''}#${t.id} ${CLASS_NAME[t.classId] || t.classId} ${(t.score * 100) | 0}%`
+          : (isTarget && hud.pinnedId === t.id ? '📌 手動鎖定' : null),
       });
     }
 

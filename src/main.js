@@ -411,6 +411,23 @@ async function requestWakeLock() {
 }
 
 // ---------- 按鈕 ----------
+// ---- 手動鎖定前車：點畫面上的車 → 釘選；再點一次 → 取消 ----
+// 自動選取在手持工況下已知會錯，而使用者一眼就知道誰是前車。
+// 非除錯模式下其他車不畫框，但點按判定用的是 track 的框，
+// 不是畫出來的框 —— 直接點「畫面上那台車」就會中。
+video.addEventListener('click', (e) => {
+  if (!running || !pipeline.enableCarDepart) return;
+  const pt = overlay.toVideoXY(e.clientX, e.clientY);
+  if (!pt) return;
+  const r = pipeline.pinAt(pt.x, pt.y);
+  if (r.action === 'none') return;
+  lastEventText = r.action === 'pin'
+    ? '📌 已鎖定此車為前車（再點一次取消）'
+    : '📌 已取消鎖定，恢復自動選取';
+  lastEventKind = 'info';
+  lastEventTs = performance.now();
+});
+
 toggleBtn.addEventListener('click', () => { running ? stop() : start(); });
 
 fileBtn.addEventListener('click', () => fileInput.click());

@@ -4,7 +4,7 @@
 // stale-while-revalidate 很容易讓不同版本的模組混在一起（極難除錯）。
 // 離線時才回退到快取。
 
-const CACHE = 'aeye-v12';
+const CACHE = 'aeye-v13';
 
 const FILES = [
   './',

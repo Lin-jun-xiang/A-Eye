@@ -24,6 +24,11 @@ export class FrontCarSelector {
   constructor(cfg) {
     this.cfg = cfg;
     this.selectedId = null;
+    // 選中目標最後的框。track id 斷掉重建時（實測 37 秒內新建 119 個 track、
+    // 換手 35 次），遲滯若只認 id 就會歸零 —— 任何候選都能立刻搶走目標，
+    // 畫面上的紅框跟著跳一次大小。幾何上蓋在原框上的新 track 應該
+    // **繼承遲滯**：id 是實作細節，同一台車才是判準（與 sameTargetIou 同理）。
+    this.selectedBox = null;
     // 車道中心的橫向位置（畫面比例）。手機常常沒有裝在正中央，
     // 所以用極慢的速率線上學習，並夾在 ±0.15 內防止跑掉。
     this.laneCenterX = 0.5;
@@ -44,6 +49,7 @@ export class FrontCarSelector {
 
   reset() {
     this.selectedId = null;
+    this.selectedBox = null;
     this._frozenSince.clear();
     this._ratioLastTs.clear();
     this._ratioSamples.length = 0;
@@ -293,11 +299,21 @@ export class FrontCarSelector {
    * @returns 選中的 track 或 null
    */
   select(tracks, vw, vh, now, opts = {}) {
-    const { laneWeightFn = null, lampWeightFn = null } = opts;
+    const { laneWeightFn = null, lampWeightFn = null, detIntervalMs = 0 } = opts;
     let best = null, bestScore = -1;
     let current = null, currentScore = -1;
+    // 遲滯的幾何繼承人：selectedId 已死，但框蓋在原目標框上的候選。
+    // 沒有這一層，track id 一斷（實測 37 秒內新建 119 個）遲滯就歸零，
+    // 任何候選都能立刻搶走目標 —— 紅框跟著跳一次大小。
+    let heir = null, heirScore = -1, heirIou = 0;
 
     this.noteRatioSamples(tracks, vw, vh, now);
+
+    // 新鮮度的半衰期以**實測偵測週期**為下限：寫死 400ms 在偵測 4Hz 的
+    // 實機上，目標只要漏掉一次偵測就被打折到 0.65，任何新鮮的鄰居只要
+    // 1.25 倍遲滯就搶走目標 —— 這是換手震盪的引擎之一。
+    // 「stale」的意義本來就是「比一個偵測週期舊」，不是「比 400ms 舊」。
+    const staleHalfLife = Math.max(this.cfg.frontCar.plausibility.staleHalfLifeMs, detIntervalMs);
 
     for (const tr of tracks) {
       const box = tr.boxAt(now);
@@ -313,7 +329,7 @@ export class FrontCarSelector {
       const lampW = lampWeightFn ? lampWeightFn(tr.id) : 1;
       // 新鮮度：coasting 的框是預測而不是量測，兩者同時存在時量測該贏。
       const age = Math.max(0, now - tr.lastSeenTs);
-      const freshW = Math.pow(0.5, age / this.cfg.frontCar.plausibility.staleHalfLifeMs);
+      const freshW = Math.pow(0.5, age / staleHalfLife);
 
       // 「最近」的判據改用**影像寬度**，不再用底邊高度。
       //
@@ -336,8 +352,21 @@ export class FrontCarSelector {
       const score = proximity * cw * laneW * plaus * lampW * freshW;
 
       if (tr.id === this.selectedId) { current = tr; currentScore = score; }
+      else if (this.selectedBox) {
+        // 幾何繼承人：id 不同但框蓋在原目標框上 → 同一台車換了 id
+        const ov = iou(box, this.selectedBox);
+        if (ov >= this.cfg.tracker.sameTargetIou && ov > heirIou) {
+          heirIou = ov; heir = tr; heirScore = score;
+        }
+      }
       if (score > bestScore) { bestScore = score; best = tr; }
     }
+
+    // id 死了但幾何繼承人在 → 繼承目標身分（含遲滯保護）。
+    // id 是實作細節，同一台車才是判準 —— 與 pipeline 的 sameTargetIou
+    // 換目標判定同一個邏輯，差別是這裡連**遲滯**都一起繼承，
+    // 否則每次 id 斷掉，任何候選都能免遲滯搶走目標。
+    if (!current && heir) { current = heir; currentScore = heirScore; }
 
     // 遲滯：已選中的目標要明顯輸給對手才換人，避免在兩台車之間反覆跳動
     // （v6 的 ID switch 會導致鎖到旁車道車起步 → 誤判）
@@ -348,6 +377,7 @@ export class FrontCarSelector {
 
     if (!best) { this.selectedId = null; return null; }
     this.selectedId = best.id;
+    this.selectedBox = best.boxAt(now);     // 給下一輪的幾何繼承用
 
     // 用選中的前車極慢地校正車道中心（修正手機沒裝在正中央）
     const box = best.boxAt(now);

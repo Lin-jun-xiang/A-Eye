@@ -13,6 +13,7 @@ import { Tracker } from '../../src/tracking/tracker.js';
 import { FrontCarSelector } from '../../src/logic/frontCar.js';
 import { CONFIG } from '../../src/config.js';
 import { iou } from '../../src/util/math.js';
+import { Pipeline } from '../../src/core/pipeline.js';
 
 const VW = 1280, VH = 720;
 const HFOV_DEG = 60;
@@ -459,6 +460,157 @@ console.log('=== 手持工況（2026-09-11 實測數字）：內裝不能當目�
     score(van) > 1.25 * score(icon));
   ok('vetoFloor 生效：被污染的 w/Δy 不再把真前車打成 0 分',
     sel.plausibility(van, VW, VH) >= CONFIG.frontCar.plausibility.vetoFloor);
+}
+
+console.log('');
+console.log('=== 長寬比守門：高度被儀表板汙染時，KF 框不跟著打氣筒式脹縮 ===');
+// 2026-09-11 實測：同一台靜止前車，DETR 的框在「只框車尾」(583x370) 與
+// 「連儀表板一起框」(585x645) 兩種模式間跳。寬與高必須等比例變化（剛體），
+// 高度單獨跳 = 分割抖動，KF 應以寬度 + 長寬比先驗重建高度。
+{
+  const clean = { x: 8, y: 310, w: 583, h: 370, classId: 2, score: 0.95 };
+  const dirty = { x: 6, y: 308, w: 585, h: 645, classId: 2, score: 0.90 };
+  const tr = new Tracker(CONFIG);
+  const hs = [];
+  for (let i = 0; i < 40; i++) {
+    const ts = i * 125;
+    tr.update([i % 3 === 2 ? dirty : clean], ts);      // 每 3 幀混入一次汙染框
+    const t = tr.confirmedOf(CONFIG.vehicleClasses, ts)[0];
+    if (t && i > 4) hs.push(t.boxAt(ts).h);
+  }
+  const mean = hs.reduce((a, b) => a + b, 0) / hs.length;
+  const cv = Math.sqrt(hs.reduce((a, x) => a + (x - mean) ** 2, 0) / hs.length) / mean;
+  ok(`KF 高度變異 < 5%（修正前實測 23.1%）`, cv < 0.05,
+    `變異 ${(cv * 100).toFixed(1)}%（${Math.min(...hs).toFixed(0)}~${Math.max(...hs).toFixed(0)}px）`);
+  ok('且穩定在乾淨模式附近而不是兩者的平均（±15%）',
+    Math.abs(mean - 370) / 370 < 0.15, `平均 ${mean.toFixed(0)}px vs 乾淨 370px`);
+
+  // 對照組：真的起步（寬高等比例縮小）—— 守門不得擋住真實的尺度變化
+  const tr2 = new Tracker(CONFIG);
+  let last = null;
+  for (let i = 0; i < 40; i++) {
+    const ts = i * 125;
+    const s = Math.exp(-0.2 * ts / 1000);             // V=0.2 等比例縮小
+    tr2.update([{ x: 8, y: 310, w: 583 * s, h: 370 * s, classId: 2, score: 0.95 }], ts);
+    const t = tr2.confirmedOf(CONFIG.vehicleClasses, ts)[0];
+    if (t) last = t.boxAt(ts);
+  }
+  ok('對照組：等比例縮小照常通過（KF 高度跟到真值 ±10%）',
+    last && Math.abs(last.h - 370 * Math.exp(-0.2 * 39 * 0.125)) / (370 * Math.exp(-0.2 * 39 * 0.125)) < 0.10,
+    `KF 高 ${last && last.h.toFixed(0)} vs 真值 ${(370 * Math.exp(-0.2 * 39 * 0.125)).toFixed(0)}`);
+
+  // 對稱案例（支架夜景）：部分偵測把**寬度**砍半、高度正常。
+  // 第一版守門寫死「信任寬度」，在這種輸入下拿被砍的寬度重建高度，
+  // 整個框跟著縮小 → 關聯變弱 → 乾淨影片的證據清空 4 → 10 次。
+  // 對稱版須改成信任「與 KF 預測較一致」的維度（這裡是高度）。
+  const tr3 = new Tracker(CONFIG);
+  const full = { x: 100, y: 300, w: 400, h: 300, classId: 2, score: 0.9 };
+  const part = { x: 200, y: 300, w: 190, h: 295, classId: 2, score: 0.4 };  // 只框到半台車
+  const ws3 = [];
+  for (let i = 0; i < 40; i++) {
+    const ts = i * 125;
+    tr3.update([i % 3 === 2 ? part : full], ts);
+    const t = tr3.confirmedOf(CONFIG.vehicleClasses, ts)[0];
+    if (t && i > 4) ws3.push(t.boxAt(ts).w);
+  }
+  const w3m = ws3.reduce((a, b) => a + b, 0) / ws3.length;
+  const w3cv = Math.sqrt(ws3.reduce((a, x) => a + (x - w3m) ** 2, 0) / ws3.length) / w3m;
+  ok('部分偵測（寬度被砍）混入時，KF 寬度不跟著縮（變異 < 5%）',
+    w3cv < 0.05, `變異 ${(w3cv * 100).toFixed(1)}%（${Math.min(...ws3).toFixed(0)}~${Math.max(...ws3).toFixed(0)}px，完整寬 400）`);
+}
+
+console.log('');
+console.log('=== 慢偵測（實機 1.2Hz）：coast 以偵測週期為單位、外推有阻尼 ===');
+// 實機 DETR 偵測間隔 833ms。固定 maxCoastMs=1500 = 漏一次偵測就淘汰 track
+//（1.67s > 1.5s）—— 手動鎖定「很容易斷掉」與目標框閃爍的機制。
+{
+  const box = { x: 100, y: 300, w: 400, h: 300, classId: 2, score: 0.9 };
+  const tr = new Tracker(CONFIG);
+  tr.detIntervalMs = 833;                       // 實測偵測週期（pipeline 餵入）
+  tr.update([box], 0);
+  tr.update([box], 833);                        // confirmHits=2 → 確認
+  tr.update([], 833 + 1670);                    // 漏一次偵測（間隔 2 個週期）
+  ok('漏一次偵測後 track 仍活著（coastDetPeriods=3）', tr.tracks.length === 1,
+    `tracks=${tr.tracks.length}`);
+  tr.update([], 833 + 3 * 833 + 200);           // 超過 3 個週期 → 該淘汰了
+  ok('超過 3 個偵測週期才淘汰', tr.tracks.length === 0, `tracks=${tr.tracks.length}`);
+
+  // 外推阻尼：把速度雜訊灌進 KF（兩筆寬度遞增的偵測），外推 3 秒。
+  // 線性外推會讓框無限變寬 —— 實機「框一直跑掉、越變越寬」的機制。
+  const tr2 = new Tracker(CONFIG);
+  tr2.detIntervalMs = 833;
+  tr2.update([{ ...box, w: 400 }], 0);
+  tr2.update([{ ...box, w: 424 }], 833);        // +6% → lw.v > 0
+  const t2 = tr2.tracks[0];
+  // 分段阻尼：寬限期（一個偵測週期，833ms）內維持線性 —— 關聯需要完整
+  // 預測（全程阻尼實測讓 8Hz 支架影片的綠燈事件晚 1.6 秒）。
+  // 量測點取寬限期**之後**：位移上界是 v·(週期 + τ)。
+  // 寬限期 = coastGraceDetPeriods × 偵測週期（由 config 推導，不寫死）
+  const grace = CONFIG.tracker.coastGraceDetPeriods * 0.833;
+  const tau = CONFIG.tracker.coastVelocityTauMs / 1000;
+  const w3s = t2.boxAt(833 + 3000).w;
+  const w6s = t2.boxAt(833 + 6000).w;
+  const bound = 424 * Math.exp(Math.log(424 / 400) / 0.833 * (grace + tau)) * 1.02;
+  ok('寬限期後外推位移有界（不再線性變寬）', w6s <= bound && w6s - w3s < 0.02 * w3s,
+    `3s 後 ${w3s.toFixed(0)}px、6s 後 ${w6s.toFixed(0)}px（上界 ${bound.toFixed(0)}）`);
+}
+
+console.log('');
+console.log('=== 手動鎖定：點選、巢狀框、id 斷掉接回、寬限期恢復自動 ===');
+{
+  // Pipeline 建構時 OpticalFlow 需要 canvas —— node 下給最小 shim
+  //（與 tools/offline/harness.mjs 的 installShims 同一招，這裡只需要兩個方法）
+  if (typeof OffscreenCanvas === 'undefined') {
+    globalThis.OffscreenCanvas = class {
+      constructor(w, h) { this.width = w; this.height = h; }
+      getContext() { return {}; }
+    };
+  }
+  const pl = new Pipeline({ cfg: CONFIG, gps: null, imu: null });
+  pl.lastVw = 720; pl.lastVh = 1280;
+  const tr = pl.tracker;
+  const big =   { x:  50, y: 300, w: 600, h: 500, classId: 2, score: 0.9 };  // 大框（車陣）
+  const small = { x: 200, y: 400, w: 180, h: 140, classId: 2, score: 0.8 };  // 巢在大框裡的那台
+  for (let i = 0; i < 4; i++) { pl.lastNow = i * 125; tr.update([big, small], i * 125); }
+  const now0 = 375;
+
+  // (1) 點在巢狀區域 → 取內含點的**最小**框
+  const r1 = pl.pinAt(280, 460);
+  const smallTrack = tr.tracks.find((t) => iou(t.boxAt(now0), small) > 0.8);
+  ok('點到巢狀框 → 鎖定較小的那台', r1.action === 'pin' && r1.id === smallTrack.id,
+    `pinAt → #${r1.id}，小車 #${smallTrack.id}`);
+
+  // (2) 鎖定的目標在解析時勝出（不經過自動選取）
+  const t2 = pl._resolvePinned(tr.confirmedOf(CONFIG.vehicleClasses, now0), now0, []);
+  ok('解析回鎖定的 track', t2 && t2.id === smallTrack.id);
+
+  // (3) track id 斷掉、新 id 在同一位置重建 → 幾何接回
+  const deadline = now0 + CONFIG.tracker.maxCoastMs + 200;
+  tr.tracks.length = 0;                                    // 模擬 track 全滅
+  tr.update([small], deadline);                            // 同位置的新偵測 → 新 id
+  tr.update([small], deadline + 125);                      // confirmHits=2
+  const vt = tr.confirmedOf(CONFIG.vehicleClasses, deadline + 125);
+  const t3 = pl._resolvePinned(vt, deadline + 125, []);
+  ok('id 斷掉後用幾何接回（新框蓋在原框上）', t3 !== null && pl.pinnedId === t3.id,
+    `接回 #${t3 && t3.id}`);
+
+  // (4) 目標真的離開：寬限期內不換人，逾時恢復自動 + 無聲事件
+  tr.tracks.length = 0;
+  const evs = [];
+  const tGone = deadline + 200;
+  pl._resolvePinned([], tGone, evs);
+  ok('寬限期內維持鎖定（不讓自動選取接手）', pl.pinnedId !== null && evs.length === 0);
+  pl._resolvePinned([], tGone + CONFIG.frontCar.pin.lostRevertMs + 100, evs);
+  ok('逾時恢復自動選取並發出無聲事件',
+    pl.pinnedId === null && evs.length === 1 && evs[0].silent === true, evs[0] && evs[0].text);
+
+  // (5) 再點一次同一台 → 取消鎖定
+  const pl2 = new Pipeline({ cfg: CONFIG, gps: null, imu: null });
+  pl2.lastVw = 720; pl2.lastVh = 1280;
+  for (let i = 0; i < 3; i++) { pl2.lastNow = i * 125; pl2.tracker.update([small], i * 125); }
+  const a = pl2.pinAt(280, 460);
+  const b = pl2.pinAt(280, 460);
+  ok('點第二次取消鎖定', a.action === 'pin' && b.action === 'unpin' && pl2.pinnedId === null);
 }
 
 console.log('');

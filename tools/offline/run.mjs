@@ -48,6 +48,18 @@ const next = frameReader(process.stdin, FRAME);
 //（3 筆偵測 @1.2Hz = 2.5 秒），量測間隔直接掉進 SPRT 的不可達區。
 // 凡是與量測率有關的結論，必須在 DETECT_HZ=1.2 下重跑一次才算數。
 const detGap = 1000 / (Number(process.env.DETECT_HZ) || CONFIG.loop.detectHz);
+// CFG='{"tracker":{"coastVelocityTauMs":1e9}}' —— 對 CONFIG 做深度合併覆寫。
+// 用途：二分定位（「這個回歸是哪個參數造成的？」）不必改碼重跑。
+if (process.env.CFG) {
+  const merge = (dst, src) => {
+    for (const k of Object.keys(src)) {
+      if (src[k] && typeof src[k] === 'object' && !Array.isArray(src[k])) merge(dst[k] ??= {}, src[k]);
+      else dst[k] = src[k];
+    }
+  };
+  merge(CONFIG, JSON.parse(process.env.CFG));
+  process.stderr.write(`CFG 覆寫: ${process.env.CFG}\n`);
+}
 let lastDet = -Infinity, f = 0;
 const events = [];
 

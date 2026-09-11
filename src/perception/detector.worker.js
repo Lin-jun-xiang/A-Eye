@@ -349,7 +349,25 @@ function decodeDetr(res, geo) {
     if (bw <= 1 || bh <= 1) continue;
     boxes.push({ x, y, w: bw, h: bh, score: bs, classId: mapped });
   }
-  return boxes;                     // 刻意不做 NMS
+  // 仍然不做跨物件 NMS（集合預測不會把前車和旁車併成一個大框），
+  // 但要去掉**近重複框**：實測這份匯出會對同一台車輸出兩個幾乎一樣的框
+  //（2026-09-11：581x370 conf .98 與 583x371 conf .90，IoU 0.87 ——
+  //  兩個都過高分門檻，追蹤器因此建出平行軌跡、目標在其間反覆換手）。
+  // 同類且 IoU > dedupIou 視為同一物體，保留信心較高者。
+  return dedupSameClass(boxes, detrCfg.dedupIou);
+}
+
+function dedupSameClass(boxes, iouTh) {
+  boxes.sort((a, b) => b.score - a.score);
+  const keep = [];
+  for (const b of boxes) {
+    let dup = false;
+    for (const k of keep) {
+      if (k.classId === b.classId && iouXYWH(k, b) > iouTh) { dup = true; break; }
+    }
+    if (!dup) keep.push(b);
+  }
+  return keep;
 }
 
 function iouXYWH(a, b) {

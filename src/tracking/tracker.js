@@ -35,6 +35,12 @@ export class Tracker {
   constructor(cfg = CONFIG) {
     this.cfg = cfg;
     this.tracks = [];
+    // 實測的偵測間隔（由 pipeline.onDetections 餵入）。
+    // maxCoastMs=1500 是假設偵測 ~8Hz 時調的；實機 DETR 只有 1.2Hz
+    //（間隔 833ms），**漏掉一次偵測 track 就被淘汰** —— 這正是
+    // 手動鎖定「很容易斷掉」與目標框閃爍消失的機制。
+    // coast 容忍度必須以實際節拍為單位，不能用固定毫秒數。
+    this.detIntervalMs = 0;
     // 關聯的收支帳。實車除錯需要分辨兩種完全不同的失效：
     //   偵測進來但配不上 → 關聯門檻的問題
     //   偵測根本沒進來   → 偵測器的問題
@@ -55,6 +61,10 @@ export class Tracker {
     const t = this.cfg.tracker;
     const tracks = this.tracks;
     const confHigh = this.cfg.yolo.confThreshold;
+
+    // 外推阻尼的寬限期 = 實測偵測週期（KalmanBox.boxAt 的分段點）。
+    // 每次更新都刷，因為偵測節拍會隨推論負載漂移。
+    for (const tr of tracks) tr.kf.coastGraceMs = t.coastGraceDetPeriods * this.detIntervalMs;
 
     // ---- BYTE：把偵測分成高分層與低分層 ----
     // 低分框通常是**真的物體**（被遮擋、動態模糊、夜間過曝），不是背景。
@@ -86,7 +96,8 @@ export class Tracker {
 
     // ---- 淘汰超過 coast 時間的 track ----
     const before = tracks.length;
-    this.tracks = tracks.filter((tr) => ts - tr.lastSeenTs <= t.maxCoastMs);
+    const coast = this.effCoastMs();
+    this.tracks = tracks.filter((tr) => ts - tr.lastSeenTs <= coast);
 
     this.stats.dets += hi.length;
     this.stats.detsLow += lo.length;
@@ -177,7 +188,17 @@ export class Tracker {
 
   byId(id) { return this.tracks.find((t) => t.id === id) || null; }
 
-  confirmedOf(classIds, now, maxCoastMs = this.cfg.tracker.maxCoastMs) {
+  /**
+   * 有效的 coast 容忍時間：config 的毫秒數只當下限，
+   * 真正的單位是「幾個偵測週期」—— 偵測慢的時候（實機 DETR 1.2Hz），
+   * 固定 1500ms 等於「漏一次偵測就淘汰」，track 結構上活不過任何抖動。
+   */
+  effCoastMs() {
+    const t = this.cfg.tracker;
+    return Math.max(t.maxCoastMs, t.coastDetPeriods * (this.detIntervalMs || 0));
+  }
+
+  confirmedOf(classIds, now, maxCoastMs = this.effCoastMs()) {
     return this.tracks.filter(
       (t) => t.confirmed && classIds.includes(t.classId) && now - t.lastSeenTs <= maxCoastMs
     );

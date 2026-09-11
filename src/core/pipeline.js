@@ -33,6 +33,15 @@ export class Pipeline {
     this.flow = new OpticalFlow(cfg);
     this.bboxScale = new BboxScaleEstimator(cfg);
     this.departure = new DepartureDetector(cfg);
+    // ---- 手動鎖定 ----
+    // pinnedId = 使用者點選的 track；pinnedBox = 最後一次看到它的框
+    //（track id 斷掉重建時，用「新框蓋在原框上」的幾何事實接回 ——
+    //  與 sameTargetIou 換目標判定同一個邏輯：id 是實作細節，
+    //  幾何上是同一台車才是該用的判準）。
+    this.pinnedId = null;
+    this.pinnedBox = null;
+    this.pinnedLostTs = 0;
+    this.lastNow = 0;
     // 候選平行起步判定（見 tick() 的 4.5 節）：trackId -> { bs, dep }。
     // 目標本人不在這裡面，它走 this.departure 那條含光流的主路徑。
     this.candDeparture = new Map();
@@ -86,6 +95,9 @@ export class Pipeline {
     this.departure.reset();
     this.candDeparture.clear();
     this.lastDepartFireTs = -Infinity;
+    this.pinnedId = null;
+    this.pinnedBox = null;
+    this.pinnedLostTs = 0;
     this.ego.reset();
     this.frontCar.reset();
     this.brake.reset();
@@ -124,6 +136,8 @@ export class Pipeline {
       }
     }
     this.lastDetTs = ts;
+    // tracker 的 coast 容忍度以「實測偵測週期」為單位（見 effCoastMs）
+    this.tracker.detIntervalMs = this.detIntervalMs;
     this.tracker.update(boxes, ts);
   }
 
@@ -150,10 +164,78 @@ export class Pipeline {
    * 每個 video frame 呼叫一次。
    * @returns { events: [{type, text}], hud: {...} }
    */
+  /**
+   * 手動鎖定：使用者點按畫面（影像座標）。
+   * 點到框上（含容差）→ 鎖定該 track；點到已鎖定的目標 → 取消鎖定。
+   * 巢狀框時取「內含點的最小框」—— 大框（例如整排車陣）不該搶走
+   * 使用者明顯想點的那台小車。
+   * @returns { action: 'pin'|'unpin'|'none', id? }
+   */
+  pinAt(x, y) {
+    const now = this.lastNow;
+    const tol = this.cfg.frontCar.pin.tapMaxDistFrac
+      * Math.min(this.lastVw || 1e9, this.lastVh || 1e9);
+    let inBest = null, inArea = Infinity;      // 內含點的框：取最小面積
+    let nearBest = null, nearD = tol;          // 沒點中任何框：取容差內最近的
+    for (const tr of this.tracker.confirmedOf(this.cfg.vehicleClasses, now)) {
+      const b = tr.boxAt(now);
+      const dx = Math.max(b.x - x, 0, x - (b.x + b.w));
+      const dy = Math.max(b.y - y, 0, y - (b.y + b.h));
+      const d = Math.hypot(dx, dy);            // 0 = 點在框內
+      if (d === 0) {
+        const a = b.w * b.h;
+        if (a < inArea) { inArea = a; inBest = tr; }
+      } else if (d <= nearD) { nearD = d; nearBest = tr; }
+    }
+    const picked = inBest || nearBest;
+    if (!picked) return { action: 'none' };
+    if (picked.id === this.pinnedId) {
+      this.pinnedId = null; this.pinnedBox = null; this.pinnedLostTs = 0;
+      return { action: 'unpin' };
+    }
+    this.pinnedId = picked.id;
+    this.pinnedBox = picked.boxAt(now);
+    this.pinnedLostTs = 0;
+    return { action: 'pin', id: picked.id };
+  }
+
+  /**
+   * 解析鎖定目標。id 還活著就用它；死了就用幾何接回（新框蓋在原框上）；
+   * 接不回時進入寬限期（不讓自動選取亂接手），逾時恢復自動並發無聲事件。
+   * @returns 鎖定的 track，或 null（寬限期中 / 剛恢復自動）
+   */
+  _resolvePinned(vehTracks, now, events) {
+    const cfg = this.cfg;
+    let tr = this.tracker.byId(this.pinnedId);
+    if (tr && (!tr.confirmed || now - tr.lastSeenTs > this.tracker.effCoastMs())) tr = null;
+    if (!tr && this.pinnedBox) {
+      let best = null, bi = 0;
+      for (const c of vehTracks) {
+        const i = iou(c.boxAt(now), this.pinnedBox);
+        if (i > bi) { bi = i; best = c; }
+      }
+      if (best && bi >= cfg.tracker.sameTargetIou) { this.pinnedId = best.id; tr = best; }
+    }
+    if (tr) { this.pinnedBox = tr.boxAt(now); this.pinnedLostTs = 0; return tr; }
+    if (!this.pinnedLostTs) this.pinnedLostTs = now;
+    // 寬限期同樣以偵測週期為單位：實機 1.2Hz 時 4 秒只有 ~4 次偵測機會，
+    // 再加上新 track 要 confirmHits=2 才成立 —— 固定毫秒數在慢偵測下太苛
+    const revertMs = Math.max(cfg.frontCar.pin.lostRevertMs,
+      6 * (this.detIntervalMs || 0));
+    if (now - this.pinnedLostTs > revertMs) {
+      this.pinnedId = null; this.pinnedBox = null; this.pinnedLostTs = 0;
+      events.push({ type: 'pin', kind: 'info', silent: true,
+        text: '📌 鎖定目標已離開，恢復自動選取' });
+    }
+    return null;
+  }
+
   tick({ source, vw, vh, now }) {
     const cfg = this.cfg;
     const events = [];
     this.stats.ticks++;
+    this.lastNow = now;
+    this.lastVw = vw; this.lastVh = vh;
 
     // ---- 1) 地平線（IMU 重力向量）----
     // 注意單位：RLS 學到的增益是「rad → ROI 像素」，因為它是用 ROI 座標的
@@ -184,9 +266,19 @@ export class Pipeline {
       this.frontCar.learnEgoStructure(
         vehTracks, vw, vh, now, this.ego.state === EgoState.MOVING
       );
-      target = this.frontCar.select(vehTracks, vw, vh, now, {
-        lampWeightFn: (id) => this._lampWeight(id),
-      });
+      // 手動鎖定優先：使用者指定的目標只跳過**選取**，量測與判定照舊。
+      // 寬限期中（鎖定目標暫時追丟）維持無目標 —— 不讓自動選取亂接手，
+      // 否則使用者一鎖定，目標反而在「鎖定車」與「自動選的車」之間跳。
+      if (this.pinnedId !== null) {
+        target = this._resolvePinned(vehTracks, now, events);
+      }
+      if (this.pinnedId === null && target === null) {
+        target = this.frontCar.select(vehTracks, vw, vh, now, {
+          lampWeightFn: (id) => this._lampWeight(id),
+          // 新鮮度半衰期的下限（stale 的定義是「比一個偵測週期舊」）
+          detIntervalMs: this.detIntervalMs,
+        });
+      }
     }
     // ---- 換目標時要不要清空證據 ----
     // 原本是「id 一變就清空」，但實車量測顯示這會在最需要警示的那一刻把證據丟掉：
@@ -316,7 +408,7 @@ export class Pipeline {
       // 而實車量測顯示目標「短暫消失」是常態（79% 的 tick 目標都不是新的）。
       // 改成只有超過追蹤器的 coast 時間才真的放棄 —— 在那之前保留錨定，
       // 目標回來時若還在錨定框內就能直接接續。
-      if (!target && this.lastTargetTs && now - this.lastTargetTs > cfg.tracker.maxCoastMs) {
+      if (!target && this.lastTargetTs && now - this.lastTargetTs > this.tracker.effCoastMs()) {
         this.flow.reset();
       }
     }
@@ -402,6 +494,7 @@ export class Pipeline {
         assumeStill: this.assumeStill,
         speed: this.ego.speed,
         target: target ? { id: target.id, box: target.boxAt(now), score: target.score } : null,
+        pinnedId: this.pinnedId,
         tracks: this.tracker.tracks.map((t) => ({
           id: t.id, classId: t.classId, box: t.boxAt(now),
           confirmed: t.confirmed, score: t.score,
