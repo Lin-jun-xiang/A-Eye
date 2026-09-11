@@ -257,6 +257,98 @@ console.log('=== SPRT 的可達性條件（這次漏報的真正機制）===');
 }
 
 console.log('');
+console.log('=== 手持 + 儀表板入鏡：高度是雜訊、寬度才是訊號 ===');
+// 2026-09-11 實測（720x1280 手持夜景）。同一台車、同一段時間的原始偵測框，
+// 前車在 t≈2.2s 才起步：車靜止時高度擺盪 22.6%、寬度只有 0.78%。
+// 病灶是自車儀表板遮住前車下半 → 框的底邊在「車尾可見底部」與
+// 「車尾＋儀表板」之間跳。這段序列是逐字抄下來的真實量測值。
+{
+  const SEQ = [                                    // [t秒, w, h]，10Hz 取樣
+    [0.2, 581, 370], [0.4, 582, 378], [0.6, 587, 645], [0.8, 584, 624],
+    [1.0, 590, 627], [1.2, 583, 631], [1.4, 584, 629], [1.6, 589, 638],
+    [1.8, 589, 439], [2.0, 574, 369],              // ← 這裡之前車是靜止的
+    [2.6, 544, 359], [3.0, 468, 312], [3.2, 430, 298], [3.4, 400, 286],
+    [3.6, 359, 272], [3.8, 326, 252], [4.0, 298, 249], [4.2, 262, 233],
+    [4.4, 237, 217], [4.6, 227, 212], [4.8, 217, 205],
+  ];
+  const cvOf = (a) => {
+    const m = a.reduce((x, y) => x + y, 0) / a.length;
+    return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / a.length) / m;
+  };
+  const still = SEQ.filter((r) => r[0] <= 2.0);
+  check('靜止期：寬度變異 < 2%（訊號乾淨）', cvOf(still.map((r) => r[1])) < 0.02,
+    `${(cvOf(still.map((r) => r[1])) * 100).toFixed(2)}%`);
+  check('靜止期：高度變異 > 15%（底邊被遮擋污染）', cvOf(still.map((r) => r[2])) > 0.15,
+    `${(cvOf(still.map((r) => r[2])) * 100).toFixed(2)}%`);
+
+  // 把真實序列餵給估計器：靜止那 2 秒不得產出顯著證據
+  const est = new BboxScaleEstimator(CONFIG);
+  const dep = new DepartureDetector(CONFIG);
+  const tr = { id: 9, lastBox: null, lastBoxTs: -1 };
+  let firedWhileStill = 0, firedAfter = 0, vAfter = [];
+  for (const [t, w, h] of SEQ) {
+    const ts = t * 1000;
+    tr.lastBox = { x: 10, y: 300, w, h };
+    tr.lastBoxTs = ts;
+    const m = est.update(tr, ts, 720, 1280);
+    if (!m.ok) { dep.coast(ts); continue; }
+    if (t > 2.0) vAfter.push(-m.logSRel / m.dt);
+    const r = dep.update(m, { ts, egoStill: true, trusted: true, primed: false, priorLlr: 0, armed: true });
+    if (r.fired) { if (t <= 2.0) firedWhileStill++; else firedAfter++; }
+  }
+  check('車靜止的前 2 秒 → 0 次誤報', firedWhileStill === 0, `觸發 ${firedWhileStill} 次`);
+  const vMean = vAfter.length ? vAfter.reduce((a, b) => a + b, 0) / vAfter.length : 0;
+  // 由寬度 574→217、歷時 2.8 秒推得的真值 V = 0.347
+  check('起步後估出的 V 對得上真值 0.347（±30%）', Math.abs(vMean - 0.347) < 0.105,
+    `V̄ = ${vMean.toFixed(3)}（n=${vAfter.length}）`);
+}
+
+console.log('');
+console.log('=== 被畫面裁切的寬度是設限值，不是量測 ===');
+// 自車儀表板被偵測成 car 時，框的左右兩緣都貼著畫面邊，寬度被畫面卡死。
+// 若把它當有效量測，偵測抖動會被讀成真實尺度變化 ——
+// 實測那個內裝框量出 V = 0.061（minInvTtc 的 3 倍、TTC 16 秒）。
+// 規則是**拒絕量測**，而不是假設抖動夠小。
+{
+  const VW = 720, VH = 1280;
+  const est = new BboxScaleEstimator(CONFIG);
+  const dep = new DepartureDetector(CONFIG);
+  const tr = { id: 10, lastBox: null, lastBoxTs: -1 };
+  let seed = 777;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff - 0.5; };
+  let ok = 0, fired = 0;
+  for (let t = 0; t <= 60000; t += 125) {
+    // 整幀寬、底邊也被裁掉，高度大幅抖動（實測 643~707，這裡放大到 ±15%）
+    const h = 660 * (1 + 0.3 * rnd());
+    tr.lastBox = { x: 0, y: VH - h, w: VW, h };
+    tr.lastBoxTs = t;
+    const m = est.update(tr, t, VW, VH);
+    if (m.ok) { ok++; const r = dep.update(m, { ts: t, egoStill: true, trusted: true, primed: false, priorLlr: 0, armed: true }); if (r.fired) fired++; }
+    else dep.coast(t);
+  }
+  check('60 秒內產出 0 筆量測（不是「量測後被門檻擋下」）', ok === 0, `量測 ${ok} 筆`);
+  check('因此結構上不可能觸發', fired === 0, `觸發 ${fired} 次`);
+  check('理由標示為 width-censored', est.lastReason === 'width-censored', est.lastReason);
+
+  // 對照組：同樣的高度抖動，但左右緣沒有貼邊 → 正常產出量測且不誤報
+  const est2 = new BboxScaleEstimator(CONFIG);
+  const dep2 = new DepartureDetector(CONFIG);
+  const tr2 = { id: 11, lastBox: null, lastBoxTs: -1 };
+  let ok2 = 0, fired2 = 0;
+  for (let t = 0; t <= 60000; t += 125) {
+    const h = 660 * (1 + 0.3 * rnd());
+    tr2.lastBox = { x: 40, y: VH - h, w: 560, h };          // 兩側都在畫面內
+    tr2.lastBoxTs = t;
+    const m = est2.update(tr2, t, VW, VH);
+    if (m.ok) { ok2++; const r = dep2.update(m, { ts: t, egoStill: true, trusted: true, primed: false, priorLlr: 0, armed: true }); if (r.fired) fired2++; }
+    else dep2.coast(t);
+  }
+  check('對照組：寬度沒被裁 → 正常產出量測', ok2 > 30, `量測 ${ok2} 筆`);
+  check('對照組：高度狂抖但寬度恆定 → 0 次誤報（高度不參與尺度）',
+    fired2 === 0, `觸發 ${fired2} 次`);
+}
+
+console.log('');
 if (fails) {
   console.log(`❌ ${fails} 項未通過`);
   process.exitCode = 1;

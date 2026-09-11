@@ -33,6 +33,12 @@ export class Pipeline {
     this.flow = new OpticalFlow(cfg);
     this.bboxScale = new BboxScaleEstimator(cfg);
     this.departure = new DepartureDetector(cfg);
+    // 候選平行起步判定（見 tick() 的 4.5 節）：trackId -> { bs, dep }。
+    // 目標本人不在這裡面，它走 this.departure 那條含光流的主路徑。
+    this.candDeparture = new Map();
+    // 管線級的警示冷卻。每個候選的 DepartureDetector 各有自己的 lastFireTs，
+    // 沒有這一層的話「同一次起步」會被多個候選各報一次。
+    this.lastDepartFireTs = -Infinity;
     this.ego = new EgoMotionEstimator(cfg, gps, imu);
     this.frontCar = new FrontCarSelector(cfg);
     this.brake = new BrakeLightDetector(cfg);
@@ -78,6 +84,8 @@ export class Pipeline {
     this.flow.reset();
     this.bboxScale.reset();
     this.departure.reset();
+    this.candDeparture.clear();
+    this.lastDepartFireTs = -Infinity;
     this.ego.reset();
     this.frontCar.reset();
     this.brake.reset();
@@ -266,7 +274,7 @@ export class Pipeline {
         // 但**只有在光流這一 tick 沒產出量測時才採用它的結果** ——
         // 同一 tick 送兩筆量測等於把同一份物理事實計入兩次證據，
         // 那正是 v6 SPRT 的原始錯誤。
-        const bboxRes = this.bboxScale.update(target, now);
+        const bboxRes = this.bboxScale.update(target, now, vw, vh);
         const useBbox = !(flowRes && flowRes.ok) && bboxRes.ok;
         if (useBbox) this.stats.bboxOk++;
 
@@ -287,7 +295,12 @@ export class Pipeline {
             priorLlr: this.brake.priorLlr(),
             armed: now - target.firstTs >= cfg.departure.armMs,
           });
-          if (r.fired) events.push({ type: 'move', text: '🚗 前車已起步！', kind: 'depart' });
+          // 冷卻由管線層共用（候選那條路也會發同一個事件），
+          // 否則同一次起步會被主路徑與候選各報一次。
+          if (r.fired && now - this.lastDepartFireTs >= cfg.departure.cooldownMs) {
+            this.lastDepartFireTs = now;
+            events.push({ type: 'move', text: '🚗 前車已起步！', kind: 'depart' });
+          }
         } else {
           const reason = flowRes ? flowRes.reason : 'cv-not-ready';
           this.stats.flowFail[reason] = (this.stats.flowFail[reason] || 0) + 1;
@@ -305,6 +318,62 @@ export class Pipeline {
       // 目標回來時若還在錨定框內就能直接接續。
       if (!target && this.lastTargetTs && now - this.lastTargetTs > cfg.tracker.maxCoastMs) {
         this.flow.reset();
+      }
+    }
+
+    // ---- 4.5) 候選平行起步判定 ----
+    //
+    // 為什麼需要它：在這之前，整條警示路徑掛在「`selectedId` 有選對」這一件事上。
+    // 而 2026-09-11 的手持實測顯示選取本身就會錯得很徹底 —— 自車儀表板被
+    // DETR 認成 car，它的底邊在畫面最下緣 → proximity 拿到理論最大值 1.0，
+    // **每一個 tick 都被選成前車**，於是真前車從頭到尾沒有被量過一次。
+    //
+    // 三種「辨識出內裝」的方法都被實測否決了（幾何：接地點被儀表板遮住，
+    // 量到的不是接地點；視差：晃動是旋轉主導，內裝 1.2~1.3 vs 車外 1.0~1.2
+    // px/幀；語意分割：內裝被分類成 car 100%，因為分割必須給每個像素一個
+    // 類別、沒有「以上皆非」）。
+    //
+    // 所以改變的是架構而不是判據：**讓選錯目標不再致命**。
+    // 起步量測同時跑在所有候選上，選取只決定「哪一個享有昂貴的光流路徑」。
+    // bboxScale 只吃框的數字、不碰像素，每個候選各跑一份幾乎免費。
+    //
+    // 兩件必須守住的事：
+    //   * **目標本人不在這裡重複計算。** 它的證據已經走 this.departure
+    //     （光流 + bbox 兩條路），在這裡再算一份等於把同一份物理事實
+    //     計入兩次證據 —— 那正是 v6 SPRT 的原始錯誤。
+    //   * **冷卻是管線級的。** 每個候選各有自己的 lastFireTs，
+    //     沒有共用冷卻的話多個候選會各自發一次警示。
+    if (this.enableCarDepart) {
+      const alive = new Set();
+      for (const tr of vehTracks) {
+        alive.add(tr.id);
+        if (target && tr.id === target.id) continue;          // 目標走主路徑
+        if (!this.frontCar.isCandidate(tr.boxAt(now), vw, vh)) continue;
+
+        let e = this.candDeparture.get(tr.id);
+        if (!e) {
+          e = { bs: new BboxScaleEstimator(cfg), dep: new DepartureDetector(cfg) };
+          this.candDeparture.set(tr.id, e);
+        }
+        const r = e.bs.update(tr, now, vw, vh);
+        if (!r.ok) { e.dep.coast(now); continue; }
+        const d = e.dep.update(r, {
+          ts: now,
+          egoStill: canAlert,
+          trusted: this.trusted,
+          // 剎車燈只分析被選中的目標，所以候選沒有這個先驗 —— 給中性值，
+          // 不要拿目標的剎車燈狀態去套在別台車上。
+          primed: false,
+          priorLlr: 0,
+          armed: now - tr.firstTs >= cfg.departure.armMs,
+        });
+        if (d.fired && now - this.lastDepartFireTs >= cfg.departure.cooldownMs) {
+          this.lastDepartFireTs = now;
+          events.push({ type: 'move', text: '🚗 前車已起步！', kind: 'depart' });
+        }
+      }
+      for (const id of this.candDeparture.keys()) {
+        if (!alive.has(id)) this.candDeparture.delete(id);     // track 死了就丟掉
       }
     }
 

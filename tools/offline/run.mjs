@@ -42,7 +42,12 @@ pipeline.assumeStill = process.env.ASSUME_STILL === '1';
 await pipeline.initCv(async () => {});
 
 const next = frameReader(process.stdin, FRAME);
-const detGap = 1000 / CONFIG.loop.detectHz;
+// DETECT_HZ=1.2 模擬實機的偵測率。這個開關的存在是一次教訓：
+// 離線跑機預設 detectHz=8，而手機上 DETR@480 fp16 實測只有 1.2Hz ——
+// 用 8Hz 驗證過的「bbox 尺度路徑會觸發」在實機上根本湊不滿 600ms 窗口
+//（3 筆偵測 @1.2Hz = 2.5 秒），量測間隔直接掉進 SPRT 的不可達區。
+// 凡是與量測率有關的結論，必須在 DETECT_HZ=1.2 下重跑一次才算數。
+const detGap = 1000 / (Number(process.env.DETECT_HZ) || CONFIG.loop.detectHz);
 let lastDet = -Infinity, f = 0;
 const events = [];
 

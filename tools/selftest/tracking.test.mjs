@@ -208,7 +208,9 @@ console.log('=== 自車結構（引擎蓋／儀表板被 YOLO 認成 car）不�
   const sel = new FrontCarSelector(CONFIG);
   sel.aspect = VH / VW;
 
-  const proxOf = (b) => ((b.y + b.h) / VH - sel.horizon) / (1 - sel.horizon);
+  // 鏡像 select() 的實際排序公式：proximity = 影像寬度（2026-09-11 起，
+  // 底邊高度被證明會被自車內裝遮擋污染 —— 詳見 frontCar.js 的說明）
+  const proxOf = (b) => b.w / VW;
   const scoreOf = (b) => proxOf(b) * sel.plausibility(b, VW, VH) * sel.corridorWeight(b, VW, VH);
   console.log(`  引擎蓋: aspect=${(hood.w / hood.h).toFixed(2)}`
     + ` w/dy=${sel.groundRatio(hood, VW, VH).toFixed(2)}`
@@ -421,12 +423,42 @@ console.log('=== 方向盤／儀表板：底邊貼著畫面下緣，但寬度遠
   ok('8m 外的真前車不受影響', pc > 0.9, `plaus=${pc.toFixed(3)}`);
   ok('底邊未裁切的窄框（機車）不受這條規則影響', pm > 0.9, `plaus=${pm.toFixed(3)}`);
 
-  const prox = (b) => Math.max(0, Math.min(1,
-    ((b.y + b.h) / VH - sel.horizon) / (1 - sel.horizon)));
+  const prox = (b) => b.w / VW;   // 鏡像 select()：proximity = 影像寬度
   const sWheel = prox(wheel) * pw, sCar = prox(car) * pc;
   console.log(`  分數：方向盤 ${prox(wheel).toFixed(2)}x${pw.toFixed(2)}=${sWheel.toFixed(3)}`
     + `　真前車 ${prox(car).toFixed(2)}x${pc.toFixed(2)}=${sCar.toFixed(3)}`);
-  ok('真前車勝出（即使方向盤的 proximity 是滿分）', sCar > sWheel);
+  ok('真前車勝出', sCar > sWheel);
+}
+
+console.log('');
+console.log('=== 手持工況（2026-09-11 實測數字）：內裝不能當目標、真前車要贏 ===');
+// 720x1280 手持夜景。三個框都是 DETR 的真實輸出（座標逐字抄下）：
+//   儀表板   {0, 624, 720, 650}   左右緣都貼畫面邊、底邊也被裁
+//   儀表板上的車圖示 {0, 927, 64, 61}  真的是一張車的圖片，偵測沒有錯
+//   真前車   {8, 310, 583, 371}   接地點被儀表板遮住（底邊 y=681 不是接地點）
+{
+  const VW = 720, VH = 1280;
+  const dash = { x: 0, y: 624, w: 720, h: 650 };
+  const icon = { x: 0, y: 927, w: 64, h: 61 };
+  const van  = { x: 8, y: 310, w: 583, h: 371 };
+  const sel = new FrontCarSelector(CONFIG);
+  sel.aspect = VH / VW;
+
+  // 可量測性硬閘：寬度被畫面卡死的框，結構上不可能產出起步量測
+  ok('儀表板（左右貼邊）不是候選', !sel.isCandidate(dash, VW, VH));
+  ok('真前車是候選', sel.isCandidate(van, VW, VH));
+
+  // 寬度排序：這台前車的 w/Δy 被遮擋污染到 5.5（正常 ~1.5），
+  // 軟性檢定會降權 —— 但 vetoFloor 保證降權不是無限否決，
+  // 583px 的真前車仍須贏過 64px 的車圖示。
+  const score = (b) => (b.w / VW) * sel.plausibility(b, VW, VH) * sel.corridorWeight(b, VW, VH);
+  console.log(`  真前車 plaus=${sel.plausibility(van, VW, VH).toFixed(3)}`
+    + ` score=${score(van).toFixed(3)}　車圖示 plaus=${sel.plausibility(icon, VW, VH).toFixed(3)}`
+    + ` score=${score(icon).toFixed(3)}`);
+  ok('真前車分數高於儀表板上的車圖示（含遲滯餘裕 1.25x）',
+    score(van) > 1.25 * score(icon));
+  ok('vetoFloor 生效：被污染的 w/Δy 不再把真前車打成 0 分',
+    sel.plausibility(van, VW, VH) >= CONFIG.frontCar.plausibility.vetoFloor);
 }
 
 console.log('');

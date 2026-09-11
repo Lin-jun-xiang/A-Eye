@@ -87,6 +87,21 @@ export class FrontCarSelector {
   /** 硬性資格：只保留幾何上真的不可能是前車的排除條件 */
   isCandidate(box, vw, vh) {
     const f = this.cfg.frontCar;
+    // (0) 左右兩緣同時被畫面裁掉的框，不能當目標。
+    //
+    // 這不是幾何猜測，是可量測性論證（與 bboxScale 的 width-censored 同一條
+    // 規則、同一個容差）：這種框的寬度被畫面卡死，尺度變化率量不到 ——
+    // 一個**結構上不可能產出起步量測**的目標，選了只有壞處：它會佔住
+    // 光流與剎車燈這兩條昂貴路徑，讓真前車永遠輪不到。
+    //
+    // 2026-09-11 手持實測：自車儀表板被 DETR 認成 car 的框 5/5 幀都是
+    // 左右貼邊（x=0 且 x+w=W），而真前車 21/21 幀都不是。
+    // 真前車近到佔滿整個畫面寬時也會被此規則排除 —— 那個距離下本來就
+    // 什麼都量不了，排除是正確行為（tracker 會 coast，離開後自動恢復）。
+    {
+      const clip = this.cfg.bboxScale.edgeClipPx;
+      if (box.x <= clip && box.x + box.w >= vw - clip) return false;
+    }
     // (1) 底邊必須在地平線下方（車輪不可能在地平線之上）
     if ((box.y + box.h) / vh <= this.horizon) return false;
     // (2) 面積太小 → 太遠，量測不可靠
@@ -157,8 +172,40 @@ export class FrontCarSelector {
       if (under > 1) {
         wgt *= Math.exp(-0.5 * Math.pow((under - 1) / p.clippedSoftness, 2));
       }
+
+      // (d) 同樣只對底邊被裁掉的框：查 h/Δy 的**低側**。
+      //
+      //   由底邊：Z = f·h_cam / Δy      由高度：Z = f·H_obj / h_px
+      //   相除 → h_px/Δy = H_obj/h_cam   ← 焦距又消掉了
+      //
+      // 對底邊被裁的框，這個檢定的方向是**安全**的：遮擋/裁切只會讓 Δy
+      // 偏小、比值**偏高** —— 低側異常不可能是遮擋造成的。唯一會把比值
+      // 壓低的是上緣也被畫面裁掉，所以那種框跳過不查。
+      //
+      // 2026-09-11 實測的分布（也是選這個界線的依據）：
+      //   假框：儀表板 0.86~0.93、引擎蓋 0.69、儀表板上的車圖示 0.14
+      //   真車：≥ 1.17（車高至少 1.4m ÷ 相機高 1.2m），底邊被裁只會更高
+      //        （3m 近車實測 1.28、手持前車 1.53~2.47）
+      // clippedHeightFactor=0.85 把界線放在 1.0 —— 假框簇上限 0.93 與
+      // 真車下限 1.17 的正中間，兩側各留約 10% 餘裕吸收相機高度的個體差。
+      const topClipped = box.y <= p.bottomClipPx;
+      const dy = (box.y + box.h) - this.horizon * vh;
+      if (!topClipped && dy > 4) {
+        const hMin = (f.vehicleHeightMinM / Math.max(f.cameraHeightM, 0.1)) * dy;
+        const underH = (hMin * p.clippedHeightFactor) / Math.max(box.h, 1);
+        if (underH > 1) {
+          wgt *= Math.exp(-0.5 * Math.pow((underH - 1) / p.clippedSoftness, 2));
+        }
+      }
     }
-    return wgt;
+    // 總懲罰有下限 —— 與 SPRT 的 zClamp 同一個哲學、同一個理由：
+    // 這些檢定的輸入（bbox 底邊、地平線估計）帶著非高斯的模型誤差，
+    // 高斯尾巴給出的 e^-26 那種數字不是「26σ 的證據」，是垃圾輸入被
+    // 當成真值。2026-09-11 實測：真前車的接地點被儀表板遮住 → w/Δy
+    // 暴衝到 5.5 → 這裡回傳 0.000 → **真前車在排序裡被無限否決**，
+    // 反而輸給儀表板上 65px 的車圖示。軟性證據可以降權，不可以有
+    // 無限否決權 —— 一票否決的權力只留給 isCandidate 的可量測性論證。
+    return Math.max(wgt, p.vetoFloor);
   }
 
   /** w_px / (y_bottom − y_horizon)。地面上的車輛此值恆為 W_car/h_cam。 */
@@ -268,10 +315,24 @@ export class FrontCarSelector {
       const age = Math.max(0, now - tr.lastSeenTs);
       const freshW = Math.pow(0.5, age / this.cfg.frontCar.plausibility.staleHalfLifeMs);
 
-      // 底邊越低 = 越近（透視幾何）。正規化到 0~1。
-      const proximity = clamp(
-        ((box.y + box.h) / vh - this.horizon) / Math.max(1 - this.horizon, 1e-3), 0, 1
-      );
+      // 「最近」的判據改用**影像寬度**，不再用底邊高度。
+      //
+      // 底邊那條路（「底邊越低 = 越近」）在支架工況下是嚴格成立的透視幾何，
+      // 但 2026-09-11 手持實測證明它的前提「bbox 底邊 = 輪胎接地點」會被
+      // 自車儀表板遮擋打破：真前車的接地點藏在儀表板後面（底邊 y≈620、
+      // 儀表板上緣 y≈624），而內裝假框的底邊恰好就在畫面最下緣 ——
+      // 於是被污染的量測給了假目標理論最大分（1.0）、給真前車 0.53。
+      //
+      // 寬度沒有這個弱點：
+      //   * 同車道中，越近的車影像越寬（w_px = f·W_car/Z）—— 對「排序」而言
+      //     焦距與實際車寬只是共同倍率，同類物體比大小時自然消掉
+      //   * 遮擋只裁掉框的**下緣**，左右緣不受影響（實測真前車靜止時
+      //     寬度變異 0.78%、高度 22.6%）
+      //   * 不含 cameraHeightM、不含地平線 —— 手持晃動下沒有可以猜錯的參數
+      // 代價：跨「車 vs 機車」比寬度會偏袒車。可接受 —— 同距離下擋在
+      // 正前方的若是機車，車道權重與長寬比先驗仍在，且錯選成更寬的車
+      // 只是保守（量一台更遠的車），不是危險方向。
+      const proximity = clamp(box.w / vw, 0, 1);
       const score = proximity * cw * laneW * plaus * lampW * freshW;
 
       if (tr.id === this.selectedId) { current = tr; currentScore = score; }
