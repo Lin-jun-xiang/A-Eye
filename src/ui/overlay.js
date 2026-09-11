@@ -63,8 +63,11 @@ export class Overlay {
       const isTarget = hud.target && t.id === hud.target.id;
       if (!isTarget && !debug) continue;
       this._drawBox(t.box, {
-        color: isTarget ? '#4ade80' : (t.classId === 9 ? '#fbbf24' : 'rgba(255,255,255,0.35)'),
-        width: isTarget ? 3 : 1.5,
+        // 前車用醒目的紅色 —— 綠色在夜間畫面裡與紅綠燈、車尾燈光暈混在一起，
+        // 使用者回饋「一眼找不到系統鎖定了誰」。紅 + 加粗是畫面上唯一的紅框
+        //（紅綠燈框走 hud.light 那條路，用的是燈色本身）。
+        color: isTarget ? '#ef4444' : (t.classId === 9 ? '#fbbf24' : 'rgba(255,255,255,0.35)'),
+        width: isTarget ? 4 : 1.5,
         dash: t.coasting ? [6, 4] : null,
         label: debug
           ? `#${t.id} ${CLASS_NAME[t.classId] || t.classId} ${(t.score * 100) | 0}%`

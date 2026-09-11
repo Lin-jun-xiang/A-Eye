@@ -76,6 +76,19 @@ export class DebugPanel {
     this.el = el;
     this.visible = false;
     this.lastRender = 0;
+    // 收合狀態：路測時面板佔掉近半個畫面，使用者要能一鍵縮成一條標題列
+    //（保留標題列而不是整個關掉 —— 「除錯模式開著」這件事仍然看得見，
+    //  且隨時可以點開，不必回工具列找按鈕）。
+    this.collapsed = false;
+    if (this.el) {
+      this.bar = document.createElement('div');
+      this.bar.className = 'dp-bar';
+      this.body = document.createElement('pre');
+      this.body.className = 'dp-body';
+      this.el.append(this.bar, this.body);
+      this.bar.addEventListener('click', () => this.setCollapsed(!this.collapsed));
+      this._renderBar();
+    }
   }
 
   setVisible(v) {
@@ -83,8 +96,20 @@ export class DebugPanel {
     if (this.el) this.el.style.display = v ? 'block' : 'none';
   }
 
+  setCollapsed(v) {
+    this.collapsed = v;
+    if (!this.el) return;
+    this.el.classList.toggle('collapsed', v);
+    this._renderBar();
+  }
+
+  _renderBar() {
+    if (this.bar) this.bar.textContent = `🔍 除錯資訊 ${this.collapsed ? '▸ 點擊展開' : '▾'}`;
+  }
+
   render(now, metrics, pipeline, detector, extra = []) {
     if (!this.visible || !this.el) return;
+    if (this.collapsed) return;                   // 收合時不必組字串
     if (now - this.lastRender < 200) return;      // 面板本身不必每幀重繪
     this.lastRender = now;
 
@@ -114,6 +139,6 @@ export class DebugPanel {
       + (fails ? ` | ${fails}` : ''));
     for (const l of extra) lines.push(l);
 
-    this.el.textContent = lines.join('\n');
+    this.body.textContent = lines.join('\n');
   }
 }

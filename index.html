@@ -162,14 +162,26 @@ body {
 
 #debug-panel {
   position: absolute; top: 44px; left: 8px; right: 8px;
-  max-height: 42dvh; overflow: auto;
-  padding: 8px 10px; z-index: 20; display: none;
+  z-index: 20; display: none;
   background: rgba(0,0,0,0.72); border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 8px;
+  border-radius: 8px; overflow: hidden;
+  /* 面板本體不吃觸控（不擋鏡頭畫面的操作），只有標題列可點 */
+  pointer-events: none;
+}
+#debug-panel .dp-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; cursor: pointer; pointer-events: auto;
+  font-size: 11px; color: #a7f3d0; user-select: none;
+  background: rgba(255,255,255,0.06);
+}
+#debug-panel .dp-body {
+  margin: 0; max-height: 42dvh; overflow: auto;
+  padding: 8px 10px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10px; line-height: 1.45; white-space: pre-wrap;
-  color: #a7f3d0; pointer-events: none;
+  color: #a7f3d0;
 }
+#debug-panel.collapsed .dp-body { display: none; }
 
 #flash-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 100; opacity: 0; transition: opacity 0.15s; }
 #flash-overlay.active { opacity: 1; }
@@ -196,7 +208,7 @@ body {
 <video id="camera" autoplay playsinline muted></video>
 <canvas id="overlay"></canvas>
 <div id="analysis-panel"></div>
-<pre id="debug-panel"></pre>
+<div id="debug-panel"></div>
 
 <div id="status-bar">
   <div id="status-dot" class="inactive"></div>
